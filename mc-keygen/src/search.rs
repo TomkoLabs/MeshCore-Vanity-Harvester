@@ -1,3 +1,9 @@
+//! CPU worker pool, prefix matching and GPU dispatch.
+//!
+//! Absorbed from https://github.com/samschlegel/mc-keygen (upstream commit
+//! 62ed67f). Unchanged except that physical-core detection now reads sysfs
+//! directly instead of pulling in the `sysinfo` crate.
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -75,9 +81,45 @@ pub fn default_hybrid_cpu_threads(num_gpus: usize) -> usize {
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let physical = sysinfo::System::new().physical_core_count().unwrap_or(logical);
+    let physical = physical_core_count().unwrap_or(logical);
     let smt_factor = if physical > 0 && logical > physical { 2 } else { 1 };
     logical.saturating_sub(smt_factor * num_gpus).max(1)
+}
+
+/// Physical cores, from the kernel's CPU topology.
+///
+/// Only the logical:physical ratio matters above, purely to notice whether SMT
+/// exists. Reading the two topology files that answer that is cheaper than a
+/// dependency on a whole system-information crate, and returning `None` on
+/// anything unexpected leaves the caller's existing fallback in charge.
+#[cfg(target_os = "linux")]
+fn physical_core_count() -> Option<usize> {
+    use std::collections::HashSet;
+    use std::fs;
+
+    let mut cores: HashSet<(String, String)> = HashSet::new();
+    for entry in fs::read_dir("/sys/devices/system/cpu").ok()? {
+        let path = entry.ok()?.path();
+        let name = path.file_name()?.to_string_lossy().to_string();
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let package = fs::read_to_string(path.join("topology/physical_package_id"));
+        let core = fs::read_to_string(path.join("topology/core_id"));
+        if let (Ok(package), Ok(core)) = (package, core) {
+            cores.insert((package.trim().to_string(), core.trim().to_string()));
+        }
+    }
+    if cores.is_empty() {
+        None
+    } else {
+        Some(cores.len())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn physical_core_count() -> Option<usize> {
+    None
 }
 
 /// Parsed prefix for fast nibble-level matching.

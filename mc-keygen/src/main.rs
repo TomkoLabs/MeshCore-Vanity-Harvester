@@ -1,26 +1,31 @@
-mod bench;
-#[cfg(feature = "cuda")]
-mod gpu;
-#[cfg(feature = "metal")]
-mod metal_gpu;
-mod search;
-mod types;
+//! MeshCore vanity Ed25519 key generator.
+//!
+//! Absorbed from https://github.com/samschlegel/mc-keygen (upstream commit
+//! 62ed67f), dual-licensed MIT or Apache-2.0. See ATTRIBUTION.md for what was
+//! kept and what was removed.
+//!
+//! This binary is driven by the Python harvester, so it favours being scripted
+//! over being watched: the result goes to stdout, progress goes to stderr as
+//! plain text, and every failure path returns through one place.
 
-use std::io::{self, stdout};
-use std::time::Duration;
+// Upstream declared these modules again here, which compiled every source file
+// twice — once into the library, once into the binary. Using the library is
+// the same code and half the build.
+#[cfg(feature = "cuda")]
+use mc_keygen::gpu;
+use mc_keygen::{keygen, search, types};
+
+use std::io::{self, BufRead, Write};
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Gauge, Paragraph},
-};
+use serde::{Deserialize, Serialize};
 
 use search::SearchHandle;
+
+/// How often the plain-text progress line is refreshed.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Parser)]
 #[command(
@@ -42,7 +47,7 @@ struct Cli {
     #[arg(short = 't', long = "threads")]
     threads: Option<usize>,
 
-    /// Output result as JSON
+    /// Output the result as JSON on stdout
     #[arg(long)]
     json: bool,
 
@@ -56,7 +61,7 @@ struct Cli {
     #[arg(long, conflicts_with = "cpu_only")]
     gpu_only: bool,
 
-    /// Verify GPU keygen matches host-side reference (run 64 chain steps and compare scalar/pubkey at each step)
+    /// Cross-check GPU key generation against the host implementation and exit
     #[cfg(feature = "gpu")]
     #[arg(long)]
     verify: bool,
@@ -64,16 +69,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Benchmark performance across CPU/GPU/hybrid modes and save JSONL records.
-    Bench(bench::BenchArgs),
+    /// Verify saved public/private key pairs, reading JSON Lines on stdin.
+    ///
+    /// Each line is an object with `public_key` and `private_key` as hex; one
+    /// verdict object per line is written to stdout.
+    ///
+    /// This exists because keys found on the GPU have no seed to re-derive
+    /// from, so the harvester would otherwise have to do Ed25519 scalar
+    /// multiplication in Python — about 95 ms per key, against microseconds
+    /// here.
+    VerifyPairs,
 }
+
+// --- Errors ---------------------------------------------------------------
+
+/// Everything that can go wrong, so `main` has a single exit point.
+#[derive(Debug)]
+enum Failure {
+    Usage(String),
+    NoGpu,
+    Search(String),
+    #[cfg(feature = "cuda")]
+    Verification(String),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Usage(message) => write!(f, "{}", message),
+            Failure::NoGpu => write!(f, "--gpu-only was requested but no GPU is available"),
+            Failure::Search(message) => write!(f, "{}", message),
+            #[cfg(feature = "cuda")]
+            Failure::Verification(message) => write!(f, "GPU verification failed: {}", message),
+            Failure::Io(error) => write!(f, "{}", error),
+        }
+    }
+}
+
+impl From<io::Error> for Failure {
+    fn from(error: io::Error) -> Self {
+        Failure::Io(error)
+    }
+}
+
+// --- Prefix validation ----------------------------------------------------
 
 pub(crate) fn validate_prefix(prefix: &str) -> Result<String, String> {
     let upper = prefix.to_ascii_uppercase();
 
     // Cap is 62 not 64: nibble 63 lands on the high nibble of pubkey[31], which
     // contains the Ed25519 sign bit. The GPU kernel's fast path skips writing
-    // that bit (saves an fe_mul per iter), so a prefix that reads byte 31
+    // that bit (saves an fe_mul per iteration), so a prefix that reads byte 31
     // would compare against a zeroed sign bit and miss real matches.
     if upper.is_empty() || upper.len() > 62 {
         return Err(format!(
@@ -86,7 +133,7 @@ pub(crate) fn validate_prefix(prefix: &str) -> Result<String, String> {
         return Err(format!("prefix must be valid hex (0-9, A-F), got '{}'", prefix));
     }
 
-    // Reject prefixes that would always start with 00 or FF
+    // Reject prefixes that would always start with 00 or FF.
     if upper.starts_with("00") || upper.starts_with("FF") {
         return Err(format!(
             "prefix '{}' starts with 00 or FF, which are skipped by MeshCore",
@@ -96,6 +143,8 @@ pub(crate) fn validate_prefix(prefix: &str) -> Result<String, String> {
 
     Ok(upper)
 }
+
+// --- Formatting -----------------------------------------------------------
 
 fn format_number(n: u64) -> String {
     let s = n.to_string();
@@ -114,256 +163,77 @@ fn format_duration(secs: f64) -> String {
         format!("{:.1}s", secs)
     } else if secs < 3600.0 {
         let mins = (secs / 60.0).floor();
-        let rem = secs - mins * 60.0;
-        format!("{}m {:.0}s", mins as u64, rem)
+        format!("{}m {:.0}s", mins as u64, secs - mins * 60.0)
     } else {
         let hours = (secs / 3600.0).floor();
         let rem = secs - hours * 3600.0;
-        let mins = (rem / 60.0).floor();
-        format!("{}h {}m", hours as u64, mins as u64)
+        format!("{}h {}m", hours as u64, (rem / 60.0).floor() as u64)
     }
 }
 
-fn run_tui_loop(
-    handle: SearchHandle,
-    prefixes: &[String],
-    expected: u64,
-    mode_label: &str,
-) -> io::Result<Result<types::SearchResult, types::SearchError>> {
-    enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+// --- Batch verification ---------------------------------------------------
 
-    let prefix_display = if prefixes.len() == 1 {
-        prefixes[0].clone()
-    } else {
-        prefixes.join(", ")
-    };
-    let prefix_label = if prefixes.len() == 1 {
-        "Searching for prefix: ".to_string()
-    } else {
-        format!("Searching for {} prefixes: ", prefixes.len())
-    };
+#[derive(Deserialize)]
+struct PairRequest {
+    public_key: String,
+    private_key: String,
+}
 
-    let result = loop {
-        let stats = handle.stats(expected);
-        let done = handle.is_done();
+#[derive(Serialize)]
+struct PairVerdict {
+    public_key: String,
+    /// True when the private key really does derive this public key.
+    valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
 
-        let mode_label_owned = mode_label.to_string();
-        let prefix_label_owned = prefix_label.clone();
-        let prefix_display_owned = prefix_display.clone();
-        terminal.draw(|frame| {
-            let area = frame.area();
+fn verify_pairs() -> Result<(), Failure> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
 
-            let outer = Block::default()
-                .title(" mc-keygen ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
-
-            let inner = outer.inner(area);
-            frame.render_widget(outer, area);
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Length(1), // prefix line
-                    Constraint::Length(1), // blank
-                    Constraint::Length(1), // gauge
-                    Constraint::Length(1), // blank
-                    Constraint::Length(1), // keys checked
-                    Constraint::Length(1), // speed
-                    Constraint::Length(1), // elapsed
-                    Constraint::Length(1), // est remaining
-                    Constraint::Min(0),   // spacer
-                ])
-                .split(inner);
-
-            // Prefix line
-            let prefix_line = Line::from(vec![
-                Span::styled(&*prefix_label_owned, Style::default().fg(Color::Gray)),
-                Span::styled(
-                    &*prefix_display_owned,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  ({})", mode_label_owned),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(prefix_line), chunks[0]);
-
-            // Progress gauge
-            let exp = stats.expected_attempts;
-            let ratio = if exp > 0 {
-                (stats.attempts as f64 / exp as f64).min(1.0)
-            } else {
-                0.0
-            };
-            let pct_actual = if exp > 0 {
-                stats.attempts as f64 / exp as f64 * 100.0
-            } else {
-                0.0
-            };
-            let gauge_label = format!(
-                "{:.0}%  ({}/{})",
-                pct_actual,
-                format_number(stats.attempts),
-                format_number(exp),
-            );
-            let gauge = Gauge::default()
-                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-                .ratio(ratio)
-                .label(gauge_label);
-            frame.render_widget(gauge, chunks[2]);
-
-            // Stats
-            let keys_line = Line::from(vec![
-                Span::styled("Keys checked:   ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format_number(stats.attempts),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(keys_line), chunks[4]);
-
-            let speed_line = Line::from(vec![
-                Span::styled("Speed:          ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!("{} keys/sec", format_number(stats.keys_per_sec as u64)),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(speed_line), chunks[5]);
-
-            let elapsed_line = Line::from(vec![
-                Span::styled("Elapsed:        ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format_duration(stats.elapsed_secs),
-                    Style::default().fg(Color::White),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(elapsed_line), chunks[6]);
-
-            let remaining = if stats.keys_per_sec > 0.0 && stats.attempts < exp {
-                let rem = (exp - stats.attempts) as f64 / stats.keys_per_sec;
-                format_duration(rem)
-            } else if stats.attempts >= exp {
-                "any moment...".to_string()
-            } else {
-                "calculating...".to_string()
-            };
-            let remaining_line = Line::from(vec![
-                Span::styled("Est. remaining: ", Style::default().fg(Color::Gray)),
-                Span::styled(remaining, Style::default().fg(Color::White)),
-            ]);
-            frame.render_widget(Paragraph::new(remaining_line), chunks[7]);
-        })?;
-
-        if done {
-            break handle.finish();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-
-        // Poll for Ctrl+C / 'q' to allow clean exit, otherwise tick every 50ms
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q')
-                    || key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(event::KeyModifiers::CONTROL)
-                {
-                    // Restore terminal before exiting
-                    disable_raw_mode()?;
-                    execute!(stdout(), LeaveAlternateScreen)?;
-                    std::process::exit(130);
-                }
-            }
-        }
-    };
-
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen)?;
-
-    Ok(result)
+        let verdict = match serde_json::from_str::<PairRequest>(trimmed) {
+            Ok(request) => match keygen::public_key_from_private_hex(&request.private_key) {
+                Ok(derived) => PairVerdict {
+                    valid: derived.eq_ignore_ascii_case(&request.public_key),
+                    public_key: request.public_key,
+                    error: None,
+                },
+                Err(message) => PairVerdict {
+                    public_key: request.public_key,
+                    valid: false,
+                    error: Some(message),
+                },
+            },
+            Err(error) => PairVerdict {
+                public_key: String::new(),
+                valid: false,
+                error: Some(format!("malformed request: {}", error)),
+            },
+        };
+        writeln!(out, "{}", serde_json::to_string(&verdict).expect("verdict serialises"))?;
+    }
+    out.flush()?;
+    Ok(())
 }
 
-fn print_colored_result(result: &types::SearchResult) {
-    use crossterm::style::{self, Stylize};
-
-    // Green checkmark + bold "Match found!" line
-    let attempts_str = format_number(result.attempts);
-    let speed = if result.elapsed_secs > 0.0 {
-        format_number((result.attempts as f64 / result.elapsed_secs) as u64)
-    } else {
-        "N/A".to_string()
-    };
-
-    eprintln!(
-        "{}",
-        style::style(format!(
-            " ✓ Match found!  {} attempts in {} ({} keys/sec)",
-            attempts_str,
-            format_duration(result.elapsed_secs),
-            speed,
-        ))
-        .green()
-        .bold()
-    );
-    eprintln!();
-
-    // Public key with matched prefix highlighted
-    let prefix_len = result.matched_prefix.len();
-    let pk_prefix = &result.public_key[..prefix_len];
-    let pk_rest = &result.public_key[prefix_len..];
-    eprint!(
-        "{}",
-        style::style("Public Key:  ").dim()
-    );
-    eprint!(
-        "{}",
-        style::style(pk_prefix).green().bold()
-    );
-    eprintln!(
-        "{}",
-        style::style(pk_rest).white()
-    );
-
-    // Private key
-    eprint!(
-        "{}",
-        style::style("Private Key: ").dim()
-    );
-    eprintln!(
-        "{}",
-        style::style(&result.private_key).white()
-    );
-}
-
-fn print_colored_error(msg: &str) {
-    use crossterm::style::{self, Stylize};
-    eprintln!(
-        "{}",
-        style::style(format!(" ✗ Error: {}", msg)).red().bold()
-    );
-}
+// --- GPU discovery --------------------------------------------------------
 
 #[allow(unused_variables)]
 pub(crate) fn try_init_gpu(prefixes: &[String]) -> Vec<Box<dyn search::GpuSearcher>> {
-    #[cfg(feature = "metal")]
-    {
-        match metal_gpu::MetalSearcher::new(prefixes) {
-            Ok(s) => return vec![Box::new(s)],
-            Err(e) => {
-                eprintln!("Warning: Metal GPU unavailable ({}), using CPU only", e);
-                return vec![];
-            }
-        }
-    }
     #[cfg(feature = "cuda")]
     {
         match gpu::CudaSearcher::new(prefixes) {
-            Ok(s) => return vec![Box::new(s)],
-            Err(e) => {
-                eprintln!("Warning: CUDA GPU unavailable ({}), using CPU only", e);
+            Ok(searcher) => return vec![Box::new(searcher)],
+            Err(error) => {
+                eprintln!("Warning: CUDA GPU unavailable ({}), using CPU only", error);
                 return vec![];
             }
         }
@@ -382,136 +252,183 @@ fn gpu_names_label(searchers: &[Box<dyn search::GpuSearcher>]) -> String {
         .join(", ")
 }
 
-fn main() {
-    let cli = Cli::parse();
+// --- Search ---------------------------------------------------------------
 
-    if let Some(Command::Bench(args)) = cli.command {
-        if let Err(e) = bench::run(args) {
-            eprintln!("bench failed: {}", e);
-            std::process::exit(1);
-        }
-        return;
+/// Follow a running search, reporting progress on stderr so stdout stays clean.
+fn await_result(
+    handle: SearchHandle,
+    expected: u64,
+    mode_label: &str,
+    quiet: bool,
+) -> Result<types::SearchResult, Failure> {
+    if !quiet {
+        eprintln!("Searching ({})...", mode_label);
     }
+    let mut last_report = Instant::now();
+    while !handle.is_done() {
+        std::thread::sleep(Duration::from_millis(50));
+        if quiet || last_report.elapsed() < PROGRESS_INTERVAL {
+            continue;
+        }
+        last_report = Instant::now();
+        let stats = handle.stats(expected);
+        eprint!(
+            "\r  {} keys | {} | {} keys/sec | {:.0}% of expected     ",
+            format_number(stats.attempts),
+            format_duration(stats.elapsed_secs),
+            format_number(stats.keys_per_sec as u64),
+            100.0 * stats.attempts as f64 / stats.expected_attempts.max(1) as f64,
+        );
+        let _ = io::stderr().flush();
+    }
+    if !quiet {
+        eprintln!();
+    }
+    handle.finish().map_err(|e| Failure::Search(e.to_string()))
+}
 
-    let mut prefixes = Vec::new();
+fn run_search(cli: &Cli) -> Result<(), Failure> {
+    let mut prefixes = Vec::with_capacity(cli.prefix.len());
     for raw in &cli.prefix {
-        match validate_prefix(raw) {
-            Ok(p) => prefixes.push(p),
-            Err(e) => {
-                if cli.json {
-                    eprintln!("Error: {}", e);
-                } else {
-                    print_colored_error(&e);
-                }
-                std::process::exit(1);
-            }
-        }
+        prefixes.push(validate_prefix(raw).map_err(Failure::Usage)?);
     }
 
-    // Expected attempts: use shortest prefix length, divided by count of same-length prefixes
-    let min_len = prefixes.iter().map(|p| p.len()).min().unwrap();
-    let same_len_count = prefixes.iter().filter(|p| p.len() == min_len).count() as u64;
-    let expected = 16u64.pow(min_len as u32) / same_len_count;
+    #[cfg(feature = "cuda")]
+    if cli.verify {
+        eprint!("Compiling the GPU kernel and cross-checking against the host... ");
+        return match gpu::verify_gpu_keygen() {
+            Ok(()) => {
+                eprintln!("passed");
+                Ok(())
+            }
+            Err(error) => Err(Failure::Verification(error.to_string())),
+        };
+    }
 
-    let prefix_count_label = if prefixes.len() == 1 {
+    // Expected attempts: shortest prefix, divided by how many share that length.
+    let min_len = prefixes.iter().map(|p| p.len()).min().expect("at least one prefix");
+    let same_len = prefixes.iter().filter(|p| p.len() == min_len).count() as u64;
+    let expected = 16u64.saturating_pow(min_len as u32) / same_len.max(1);
+
+    let prefix_label = if prefixes.len() == 1 {
         String::new()
     } else {
         format!(", {} prefixes", prefixes.len())
     };
 
     #[cfg(feature = "gpu")]
-    let cpu_only = cli.cpu_only;
+    let (cpu_only, gpu_only) = (cli.cpu_only, cli.gpu_only);
     #[cfg(not(feature = "gpu"))]
-    let cpu_only = true;
+    let (cpu_only, gpu_only) = (true, false);
 
-    #[cfg(feature = "gpu")]
-    let gpu_only = cli.gpu_only;
-    #[cfg(not(feature = "gpu"))]
-    let gpu_only = false;
+    let gpu_searchers = if cpu_only { vec![] } else { try_init_gpu(&prefixes) };
 
-    #[cfg(feature = "gpu")]
-    if cli.verify {
-        eprint!("Compiling GPU kernel and running verification... ");
-        #[cfg(feature = "cuda")]
-        let result = gpu::verify_gpu_keygen().map_err(|e| format!("{}", e));
-        #[cfg(all(feature = "metal", not(feature = "cuda")))]
-        let result = metal_gpu::verify_gpu_keygen().map_err(|e| format!("{}", e));
-        match result {
-            Ok(()) => {
-                eprintln!("PASSED");
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("FAILED: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let gpu_searchers = if cpu_only {
-        vec![]
-    } else {
-        try_init_gpu(&prefixes)
-    };
-
-    // Hybrid mode reserves cores for the GPU dispatch thread; pure-CPU uses
-    // all logical cores. Explicit -t overrides either default.
+    // Hybrid mode reserves cores for the GPU dispatch thread; pure CPU uses all
+    // logical cores. An explicit -t overrides either default.
     let num_threads = cli.threads.unwrap_or_else(|| {
         if !gpu_searchers.is_empty() && !gpu_only {
             search::default_hybrid_cpu_threads(gpu_searchers.len())
         } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
         }
     });
 
     let (handle, mode_label) = if gpu_only {
         if gpu_searchers.is_empty() {
-            let msg = "--gpu-only requested but no GPU available";
-            if cli.json {
-                eprintln!("Error: {}", msg);
-            } else {
-                print_colored_error(msg);
-            }
-            std::process::exit(1);
+            return Err(Failure::NoGpu);
         }
-        let label = format!("{}{}", gpu_names_label(&gpu_searchers), prefix_count_label);
+        let label = format!("{}{}", gpu_names_label(&gpu_searchers), prefix_label);
         (SearchHandle::start_gpu(&prefixes, gpu_searchers), label)
     } else if gpu_searchers.is_empty() {
-        let label = format!("{} threads{}", num_threads, prefix_count_label);
+        let label = format!("{} threads{}", num_threads, prefix_label);
         (SearchHandle::start(&prefixes, num_threads), label)
     } else {
-        let gpu_label = gpu_names_label(&gpu_searchers);
-        let label = format!("{} + {} threads{}", gpu_label, num_threads, prefix_count_label);
+        let label = format!(
+            "{} + {} threads{}",
+            gpu_names_label(&gpu_searchers),
+            num_threads,
+            prefix_label
+        );
         (
             SearchHandle::start_hybrid(&prefixes, num_threads, gpu_searchers),
             label,
         )
     };
 
+    let result = await_result(handle, expected, &mode_label, cli.json)?;
+
     if cli.json {
-        match handle.finish() {
-            Ok(result) => println!("{}", serde_json::to_string_pretty(&result).unwrap()),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
+        println!("{}", serde_json::to_string(&result).expect("result serialises"));
     } else {
-        let search_result = match run_tui_loop(handle, &prefixes, expected, &mode_label) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("TUI error: {}", e);
-                std::process::exit(1);
-            }
-        };
-        match search_result {
-            Ok(result) => print_colored_result(&result),
-            Err(e) => {
-                print_colored_error(&format!("{}", e));
-                std::process::exit(1);
-            }
+        eprintln!(
+            "Found after {} attempts in {} ({} keys/sec)",
+            format_number(result.attempts),
+            format_duration(result.elapsed_secs),
+            format_number((result.attempts as f64 / result.elapsed_secs.max(1e-9)) as u64),
+        );
+        println!("public_key  {}", result.public_key);
+        println!("private_key {}", result.private_key);
+        println!("matched     {}", result.matched_prefix);
+    }
+    Ok(())
+}
+
+// --- Entry point ----------------------------------------------------------
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    let outcome = match cli.command {
+        Some(Command::VerifyPairs) => verify_pairs(),
+        None => run_search(&cli),
+    };
+
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            eprintln!("error: {}", failure);
+            ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_are_upper_cased() {
+        assert_eq!(validate_prefix("c0ffee").unwrap(), "C0FFEE");
+    }
+
+    #[test]
+    fn reserved_prefixes_are_rejected() {
+        assert!(validate_prefix("00AB").is_err());
+        assert!(validate_prefix("ffAB").is_err());
+    }
+
+    #[test]
+    fn non_hex_is_rejected() {
+        assert!(validate_prefix("COFFEE").is_err(), "the letter O is not hex");
+        assert!(validate_prefix("").is_err());
+        assert!(validate_prefix(&"A".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn the_longest_usable_prefix_is_accepted() {
+        assert_eq!(validate_prefix(&"A".repeat(62)).unwrap().len(), 62);
+    }
+
+    #[test]
+    fn numbers_are_grouped() {
+        assert_eq!(format_number(1_234_567), "1,234,567");
+        assert_eq!(format_number(0), "0");
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(format_duration(45.0), "45.0s");
+        assert_eq!(format_duration(90.0), "1m 30s");
+        assert_eq!(format_duration(7200.0), "2h 0m");
     }
 }

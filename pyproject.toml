@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshcore-vanity-harvester"
-version = "8.0.0"
+# Deliberately left at 0.0.0 and never bumped. Releases are identified by their
+# Git commit (`./run.sh --version`), because a hand-maintained number in a file
+# goes stale the moment these sources are copied into another repository.
+version = "0.0.0"
 description = "Rarity-first CPU/GPU MeshCore vanity identity harvester"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,7 +19,7 @@ classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
   "License :: OSI Approved :: MIT License",
-  "Operating System :: POSIX",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
@@ -25,7 +28,8 @@ classifiers = [
 ]
 
 [project.scripts]
-meshcore-vanity-harvester = "meshcore_vanity_harvester:main"
+meshcore-vanity-harvester = "meshcore_vanity.cli:main"
 
 [tool.setuptools]
+packages = ["meshcore_vanity"]
 py-modules = ["meshcore_vanity_harvester"]

@@ -1,0 +1,56 @@
+# Run the harvester as a background service that survives reboots.
+#
+#   sudo cp scripts/meshcore-vanity-harvester.service /etc/systemd/system/
+#   sudo systemctl edit --full meshcore-vanity-harvester   # set User and paths
+#   sudo systemctl enable --now meshcore-vanity-harvester
+#   journalctl -u meshcore-vanity-harvester -f             # watch it
+#
+# Stopping the service sends SIGTERM, which the harvester treats exactly like
+# Ctrl+C: it checkpoints and exits cleanly.
+
+[Unit]
+Description=MeshCore vanity identity harvester
+After=network.target
+Documentation=https://github.com/ripplebiz/MeshCore
+
+[Service]
+Type=simple
+
+# Change these three to match your installation.
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/opt/MeshCore-Vanity-Harvester
+
+ExecStart=/opt/MeshCore-Vanity-Harvester/run.sh
+Restart=on-failure
+RestartSec=30
+
+# The harvester saves state on SIGTERM; give it room to finish writing.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# Search work should never make the machine feel slow.
+Nice=10
+CPUWeight=20
+IOWeight=20
+
+# Private keys live in the data directory. Keep the rest of the system
+# out of reach, and the data directory out of everyone else's.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/MeshCore-Vanity-Harvester/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+UMask=0077
+
+# Uncomment for a GPU build; the CUDA driver needs these devices.
+# DeviceAllow=/dev/nvidia0 rw
+# DeviceAllow=/dev/nvidiactl rw
+# DeviceAllow=/dev/nvidia-uvm rw
+
+[Install]
+WantedBy=multi-user.target

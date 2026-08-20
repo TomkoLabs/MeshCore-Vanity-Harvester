@@ -1,3 +1,8 @@
+//! Result and statistics types.
+//!
+//! Absorbed from https://github.com/samschlegel/mc-keygen (upstream commit
+//! 62ed67f), unchanged.
+
 use std::fmt;
 
 use serde::Serialize;

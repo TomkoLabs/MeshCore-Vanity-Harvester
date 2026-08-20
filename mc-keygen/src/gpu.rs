@@ -1,3 +1,9 @@
+//! CUDA device setup and kernel driving.
+//!
+//! Absorbed from https://github.com/samschlegel/mc-keygen (upstream commit
+//! 62ed67f), unchanged. The kernel in `cuda/vanity_kernel.cu` is compiled by
+//! NVRTC when a search starts, so building this crate needs no CUDA toolkit.
+
 use std::fmt;
 use std::sync::Arc;
 

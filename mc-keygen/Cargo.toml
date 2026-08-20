@@ -1,3 +1,7 @@
+# Absorbed from https://github.com/samschlegel/mc-keygen (upstream commit
+# 62ed67f), dual-licensed MIT or Apache-2.0. See ATTRIBUTION.md for what was
+# kept, what was removed, and why.
+
 [package]
 name = "mc-keygen"
 version = "0.1.0"
@@ -5,43 +9,28 @@ edition = "2021"
 rust-version = "1.85"
 description = "MeshCore vanity Ed25519 key generator"
 license = "MIT OR Apache-2.0"
+publish = false
 
 [features]
 default = []
 # Umbrella feature implied by any GPU backend. Use for `#[cfg(feature = "gpu")]`
-# on code that's relevant to GPU search but not tied to a specific backend.
+# on code that is relevant to GPU search but not tied to a specific backend.
 gpu = []
 cuda = ["gpu", "dep:cudarc"]
-metal = ["gpu", "dep:metal"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+# Ed25519 scalar arithmetic and the base-point table the search leans on.
 curve25519-dalek = { version = "=5.0.0-pre.6", features = ["precomputed-tables"] }
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ratatui = "0.29"
-crossterm = "0.28"
-sysinfo = "0.32"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# CUDA driver bindings. Loaded dynamically at runtime, so building this crate
+# needs no CUDA toolkit; the kernel is compiled by NVRTC when a search starts.
 cudarc = { version = "0.19", optional = true, features = ["cuda-12040"] }
-metal = { version = "0.30", optional = true }
-
-[build-dependencies]
-vergen-gix = "1"
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "prefix_match"
-harness = false
-
-[[bench]]
-name = "keygen_search"
-harness = false
 
 [profile.release]
 opt-level = 3
