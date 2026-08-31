@@ -8,6 +8,28 @@ kept in a file goes stale the moment these sources are copied elsewhere.
 *data format* versions, not project versions. They exist so the program can
 recognise and migrate its own older output, and they must keep being bumped.
 
+## 2026-08-29 (offline multi-node aggregation)
+
+- Added `--merge SOURCE [...]` for combining any number of independently
+  harvested private snapshots. Inputs can be a data directory or its
+  `leaderboards_private.json`; an existing destination snapshot is included
+  automatically for safe in-place updates.
+- Every imported key pair is independently re-derived and rescored before all
+  five boards are rebuilt from the union. Integrity failures, public-only
+  snapshots, empty inputs and concurrent writes to the destination are refused.
+- Added stable per-node compute provenance (`--node-id`, defaulting to the
+  hostname). Repeated merge-and-redistribute cycles take the latest cumulative
+  counters per node, so the shared baseline is not counted again on every merge.
+- A merge regenerates every normal output atomically, including the concise
+  `leaderboards_public.txt`, while private key files retain mode `0600`.
+- Chose offline aggregation over a shared SMB state file: harvesters remain
+  independent during network outages, do not need cross-host locking, and work
+  naturally across an isolated VLAN.
+- `install.sh` now prints and verifies its physical checkout and Git revision;
+  `run.sh` invokes the module from that checkout directly. A stale editable
+  console script or a symlink into a renamed `_DELETE` checkout can no longer
+  silently select code from the wrong project copy.
+
 ## 2026-08-20 (console reporting)
 
 - **CPU finds stopped being announced once the hall of fame filled up.** A

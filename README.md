@@ -60,6 +60,14 @@ If you would rather do it by hand, the installer is a readable shell script;
 everything it does is a normal `apt`, `venv`, `pip` or `cargo` command.
 </details>
 
+The installer prints the physical checkout path and Git revision it is using.
+If that path names an old, renamed or `_DELETE` directory, stop there: the
+terminal's displayed path may be a symlink into a stale checkout. Confirm with
+`pwd -P` and `git log -1 --oneline`, update the intended checkout, then run
+`bash install.sh` again. `run.sh` executes `python -m meshcore_vanity` from its
+own checkout so an old editable console script cannot silently select a nearby
+copy.
+
 ## Which engines are running
 
 You never have to guess. The first thing `./run.sh` prints is the answer:
@@ -107,6 +115,7 @@ Results land in `data/`:
 |---|---|---|
 | `repeater_ids_public.jsonl` | public | one line per repeater ID — **start here** |
 | `leaderboards_public.json` | public | all five boards, no secrets |
+| `leaderboards_public.txt` | public | hall-of-fame public keys in rank order, one per line |
 | `private_keys_by_public_key.json` | **secret** | public key → private key |
 | `leaderboards_private.json` | **secret** | all five boards, with key material |
 | `leaderboard_history.private.jsonl` | **secret** | append-only recovery journal |
@@ -237,6 +246,8 @@ Keys beginning `00` or `FF` are rejected — MeshCore reserves them.
 --cpu-workers N        number of generic CPU workers
 --max-runtime SECONDS  stop and checkpoint after a bounded run
 --data-dir PATH        store state elsewhere (or set MESHCORE_VANITY_DATA_DIR)
+--node-id NAME         stable compute-source name (default: hostname)
+--merge SOURCE [...]   merge private snapshots into --data-dir and exit
 --no-colour            plain output (also honours NO_COLOR)
 --version              print the Git revision of this checkout
 ```
@@ -340,10 +351,75 @@ Resuming from the saved leaderboards.
   500 repeater IDs, 500 hall entries, 26B keys tried over 2d 17h
 ```
 
+## Using multiple computers
+
+Run one independent harvester per computer and periodically merge their private
+snapshots. This is deliberately offline: there is no shared-file locking, no
+SMB dependency, and no requirement that Kraken and GX10 can reach each other
+while they search. Each machine keeps running at full speed if the other one is
+off, busy, or isolated on another VLAN.
+
+The hostname is used as the compute-source identity by default. Naming it
+explicitly makes the setup self-documenting:
+
+```bash
+# On Kraken
+./run.sh --node-id kraken
+
+# On GX10
+./run.sh --node-id gx10
+```
+
+When it is time to combine them, securely transfer GX10's
+`data/leaderboards_private.json` to Kraken. Stop Kraken's harvester, then run:
+
+```bash
+./run.sh --node-id kraken --merge imports/gx10-leaderboards_private.json
+```
+
+The destination defaults to Kraken's normal `data/` directory. Its existing
+private snapshot is included automatically, so the command above merges both
+Kraken and GX10 in place. Sources may be private JSON files or complete data
+directories, and any number can be supplied:
+
+```bash
+./run.sh --node-id kraken --merge imports/gx10.json imports/node3.json
+
+# Or build a separate merged directory without touching the normal one:
+./run.sh --node-id merge-hub --data-dir /secure/merged-data \
+  --merge /secure/kraken-data /secure/gx10-data
+```
+
+The command verifies the integrity hash and independently re-derives every key
+pair, rescoring old entries before rebuilding all five boards. It refuses a
+public-only snapshot, an input with no verifiable key material, or a destination
+that is still being used by a running harvester; individual bad records are
+ignored and reported. All normal public and private output files are regenerated
+atomically.
+
+To give GX10 the combined baseline, securely copy Kraken's newly merged
+`leaderboards_private.json` to a temporary path on GX10, stop GX10's harvester,
+and merge it there:
+
+```bash
+./run.sh --node-id gx10 --merge /secure/incoming/merged-private.json
+./run.sh --node-id gx10
+```
+
+GX10's current local snapshot is again included automatically, so finds made
+after the transfer are not discarded. Per-node work counters travel with the
+snapshot; future merges take the newest counter for each node instead of
+double-counting the shared baseline. Use a unique `--node-id` for every
+simultaneously running instance, especially if two instances share a hostname.
+
+`leaderboards_private.json` contains every private identity key. Transfer it
+only over a trusted encrypted channel or encrypted removable storage, keep
+temporary copies mode `0600`, and remove them when the merge has been verified.
+
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v     # 177 tests
+python -m unittest discover -s tests -v     # 191 tests
 ./run.sh --self-test
 python scripts/calibrate.py --samples 200000
 cargo test --manifest-path mc-keygen/Cargo.toml --locked   # 27 Rust tests

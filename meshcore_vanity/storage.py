@@ -18,6 +18,7 @@ import hmac
 import json
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -35,6 +36,7 @@ from .leaderboards import (
     insert_category,
     needs_slow_verification,
     public_view,
+    record_sort_key,
     verifiable_pair,
     ranked,
     validate_record,
@@ -45,6 +47,28 @@ PRIVATE_MODE = 0o600
 DIRECTORY_MODE = 0o700
 
 RestoredState = Tuple[Board, CategoryBoards, int, float, int]
+ComputeLedger = Dict[str, Dict[str, Any]]
+
+
+class SnapshotMergeError(ValueError):
+    """A merge input was unreadable, public-only, or contained no usable keys."""
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    unique: Board
+    hall: Board
+    categories: CategoryBoards
+    compute_sources: ComputeLedger
+    attempts_total: int
+    elapsed_total: float
+    events_total: int
+    source_count: int
+    input_keys: int
+    distinct_keys: int
+    discarded_keys: int
+    rescored_keys: int
+    statistics_approximate: bool
 
 
 def utc_now() -> str:
@@ -157,6 +181,121 @@ def read_verified_json(path: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
+# --- Multi-node work provenance -------------------------------------------
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _nonnegative_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def compute_source_stats(attempts: Any = 0, elapsed: Any = 0.0,
+                         events: Any = 0) -> Dict[str, Any]:
+    return {
+        "cpu_attempts_total": _nonnegative_int(attempts),
+        "elapsed_seconds_total": round(_nonnegative_float(elapsed), 3),
+        "leaderboard_events": _nonnegative_int(events),
+    }
+
+
+def normalize_compute_ledger(value: Any) -> ComputeLedger:
+    """Return only well-shaped, non-negative per-node counters."""
+    if not isinstance(value, Mapping):
+        return {}
+    normalized: ComputeLedger = {}
+    for raw_node_id, raw_stats in value.items():
+        if not isinstance(raw_node_id, str) or not raw_node_id or len(raw_node_id) > 128:
+            continue
+        if not isinstance(raw_stats, Mapping):
+            continue
+        normalized[raw_node_id] = compute_source_stats(
+            raw_stats.get("cpu_attempts_total"),
+            raw_stats.get("elapsed_seconds_total"),
+            raw_stats.get("leaderboard_events"),
+        )
+    return {node_id: normalized[node_id] for node_id in sorted(normalized)}
+
+
+def compute_ledger_totals(ledger: Mapping[str, Mapping[str, Any]]) -> Tuple[int, float, int]:
+    normalized = normalize_compute_ledger(ledger)
+    attempts = sum(int(stats["cpu_attempts_total"]) for stats in normalized.values())
+    elapsed = sum(float(stats["elapsed_seconds_total"]) for stats in normalized.values())
+    events = sum(int(stats["leaderboard_events"]) for stats in normalized.values())
+    return attempts, round(elapsed, 3), events
+
+
+def compute_ledger_from_payload(payload: Mapping[str, Any],
+                                fallback_node_id: Optional[str] = None) -> ComputeLedger:
+    """Read a ledger, migrating a pre-ledger snapshot into one stable source."""
+    ledger = normalize_compute_ledger(payload.get("compute_sources"))
+    if ledger:
+        return ledger
+
+    node_id = fallback_node_id
+    if not node_id:
+        stored_node_id = payload.get("node_id")
+        if isinstance(stored_node_id, str) and stored_node_id:
+            node_id = stored_node_id
+    if not node_id:
+        digest = str(payload.get("integrity_sha256") or "unknown")[:16]
+        node_id = f"legacy-{digest}"
+    return {
+        node_id: compute_source_stats(
+            _first_number(payload, ("cpu_attempts_total", "attempts_total"), int, 0),
+            _first_number(payload, ("elapsed_seconds_total",), float, 0.0),
+            _first_number(payload, ("leaderboard_events",), int, 0),
+        )
+    }
+
+
+def read_compute_ledger(path: Path, fallback_node_id: Optional[str] = None) -> ComputeLedger:
+    payload = read_verified_json(path)
+    if payload is None:
+        return {}
+    return compute_ledger_from_payload(payload, fallback_node_id)
+
+
+def advance_compute_ledger(
+    ledger: Mapping[str, Mapping[str, Any]],
+    node_id: str,
+    attempts: Any = 0,
+    elapsed: Any = 0.0,
+    events: Any = 0,
+) -> ComputeLedger:
+    """Add one harvesting session's counters to its compute source."""
+    advanced = normalize_compute_ledger(ledger)
+    previous = advanced.get(node_id, compute_source_stats())
+    advanced[node_id] = compute_source_stats(
+        int(previous["cpu_attempts_total"]) + _nonnegative_int(attempts),
+        float(previous["elapsed_seconds_total"]) + _nonnegative_float(elapsed),
+        int(previous["leaderboard_events"]) + _nonnegative_int(events),
+    )
+    return {source: advanced[source] for source in sorted(advanced)}
+
+
+def merge_compute_ledgers(ledgers: Iterable[Mapping[str, Mapping[str, Any]]]) -> ComputeLedger:
+    """Union snapshots without double-counting their shared merged baseline."""
+    merged: ComputeLedger = {}
+    for ledger in ledgers:
+        for node_id, stats in normalize_compute_ledger(ledger).items():
+            previous = merged.get(node_id, compute_source_stats())
+            merged[node_id] = compute_source_stats(
+                max(int(previous["cpu_attempts_total"]), int(stats["cpu_attempts_total"])),
+                max(float(previous["elapsed_seconds_total"]), float(stats["elapsed_seconds_total"])),
+                max(int(previous["leaderboard_events"]), int(stats["leaderboard_events"])),
+            )
+    return {source: merged[source] for source in sorted(merged)}
+
+
 # --- Single-instance lock --------------------------------------------------
 
 
@@ -193,8 +332,16 @@ def build_state_payload(
     statistics_approximate: bool,
     config: Config,
     private: bool,
+    compute_sources: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     board_config = config.boards
+    ledger = normalize_compute_ledger(compute_sources)
+    if not ledger:
+        ledger = {
+            config.node_id: compute_source_stats(attempts_total, elapsed_total, events)
+        }
+    else:
+        attempts_total, elapsed_total, events = compute_ledger_totals(ledger)
     meta = {
         "state_format_version": STATE_FORMAT_VERSION,
         "source_revision": project_revision(),
@@ -213,6 +360,10 @@ def build_state_payload(
             "max_per_signature": board_config.max_per_signature,
         },
     }
+    if private:
+        # Hostnames are operational provenance, not public leaderboard data.
+        meta["node_id"] = config.node_id
+        meta["compute_sources"] = ledger
 
     def render(records: Iterable[Record]) -> list:
         ordered = ranked(records)
@@ -271,6 +422,18 @@ def write_lookup_outputs(unique: Mapping[str, Record], paths: Paths,
     )
 
 
+def write_public_leaderboard_text(hall: Mapping[str, Record], paths: Paths,
+                                  keep_backup: bool = True) -> None:
+    """Write the hall of fame as full public keys, one per ranked line."""
+    public_keys = [str(record["public_key"]) for record in ranked(hall.values())]
+    atomic_write(
+        paths.public_text,
+        "\n".join(public_keys) + ("\n" if public_keys else ""),
+        private=False,
+        keep_backup=keep_backup,
+    )
+
+
 def checkpoint(
     unique: Mapping[str, Record],
     hall: Mapping[str, Record],
@@ -282,14 +445,18 @@ def checkpoint(
     statistics_approximate: bool,
     config: Config,
     keep_backup: bool = True,
+    compute_sources: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> None:
     ensure_secure_directory(config.paths)
     common = (unique, hall, categories, attempts_total, elapsed_total, events,
               recovery_source, statistics_approximate, config)
-    atomic_write_json(config.paths.private_state, build_state_payload(*common, private=True),
+    atomic_write_json(config.paths.private_state, build_state_payload(
+        *common, private=True, compute_sources=compute_sources),
                       private=True, keep_backup=keep_backup)
-    atomic_write_json(config.paths.public_state, build_state_payload(*common, private=False),
+    atomic_write_json(config.paths.public_state, build_state_payload(
+        *common, private=False, compute_sources=compute_sources),
                       private=False, keep_backup=keep_backup)
+    write_public_leaderboard_text(hall, config.paths, keep_backup=keep_backup)
     write_lookup_outputs(unique, config.paths, keep_backup=keep_backup)
 
 
@@ -476,6 +643,115 @@ def load_state_file(path: Path, config: BoardConfig, progress=None, verifier=Non
         _first_number(payload, ("elapsed_seconds_total",), float, 0.0),
         _first_number(payload, ("leaderboard_events",), int, 0),
         rescored,
+    )
+
+
+def merge_state_files(
+    source_paths: Sequence[Path],
+    config: BoardConfig,
+    progress=None,
+    verifier=None,
+) -> MergeResult:
+    """Verify and combine any number of private snapshots.
+
+    Each input is rebuilt under the current scorer before its records enter the
+    union. Board insertion is then applied once to the full union, which makes
+    the result identical to one harvester having seen all retained candidates.
+    """
+    if not source_paths:
+        raise SnapshotMergeError("no private snapshots were supplied")
+
+    candidates_by_key: Dict[str, Record] = {}
+    ledgers: List[ComputeLedger] = []
+    input_keys = 0
+    discarded_keys = 0
+    legacy_statistics = False
+    statistics_approximate = False
+
+    for source_path in source_paths:
+        payload = read_verified_json(source_path)
+        if payload is None:
+            raise SnapshotMergeError(
+                f"{source_path}: no valid integrity-hashed snapshot or backup"
+            )
+        if payload.get("includes_secret_material") is False:
+            raise SnapshotMergeError(
+                f"{source_path}: public snapshots cannot be merged; use leaderboards_private.json"
+            )
+
+        records = _collect_records(payload)
+        distinct_input_keys = {
+            key for key in (
+                normalize_hex(record.get("public_key"), PUBLIC_KEY_HEX_LENGTH)
+                for record in records
+            ) if key is not None
+        }
+        if not distinct_input_keys:
+            raise SnapshotMergeError(f"{source_path}: snapshot contains no private leaderboard records")
+
+        source_unique, source_hall, source_categories, _rescored = _restore_records(
+            records, config, progress, verifier)
+        validated_by_key: Dict[str, Record] = {}
+        source_boards = [source_unique, source_hall, *source_categories.values()]
+        for board in source_boards:
+            for record in board.values():
+                public_key = str(record["public_key"])
+                existing = validated_by_key.get(public_key)
+                if existing is None or (
+                    existing.get("seed") is None and record.get("seed") is not None
+                ) or record_sort_key(record) > record_sort_key(existing):
+                    validated_by_key[public_key] = record
+
+        if not validated_by_key:
+            raise SnapshotMergeError(f"{source_path}: no key pair passed verification")
+
+        input_keys += len(distinct_input_keys)
+        discarded_keys += len(distinct_input_keys - set(validated_by_key))
+        for public_key, record in validated_by_key.items():
+            existing = candidates_by_key.get(public_key)
+            if existing is None or (
+                existing.get("seed") is None and record.get("seed") is not None
+            ) or record_sort_key(record) > record_sort_key(existing):
+                candidates_by_key[public_key] = record
+
+        has_ledger = bool(normalize_compute_ledger(payload.get("compute_sources")))
+        legacy_statistics = legacy_statistics or not has_ledger
+        ledgers.append(compute_ledger_from_payload(payload))
+        statistics_approximate = statistics_approximate or bool(
+            payload.get("statistics_approximate", False))
+
+    unique: Board = {}
+    hall: Board = {}
+    categories = empty_category_boards(config)
+    for record in candidates_by_key.values():
+        _insert_restored(dict(record), unique, hall, categories, config)
+
+    compute_sources = merge_compute_ledgers(ledgers)
+    attempts, elapsed, events = compute_ledger_totals(compute_sources)
+    rescored = sum(
+        1 for record in candidates_by_key.values()
+        if record.get("rescored_from_version") is not None
+    )
+    # Pre-v8 files have only one aggregate counter. It is exact by itself, but
+    # when several such snapshots meet there is no lineage with which to prove
+    # that they do not share history.
+    statistics_approximate = statistics_approximate or (
+        legacy_statistics and len(source_paths) > 1
+    )
+    return MergeResult(
+        unique=unique,
+        hall=hall,
+        categories=categories,
+        compute_sources=compute_sources,
+        attempts_total=attempts,
+        elapsed_total=elapsed,
+        events_total=events,
+        source_count=len(source_paths),
+        input_keys=input_keys,
+        distinct_keys=len(candidates_by_key),
+        discarded_keys=discarded_keys,
+        rescored_keys=rescored,
+        statistics_approximate=statistics_approximate,
     )
 
 

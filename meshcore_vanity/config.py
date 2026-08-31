@@ -9,6 +9,8 @@ can never silently disagree with its parent about the settings in force.
 from __future__ import annotations
 
 import os
+import re
+import socket
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
@@ -25,6 +27,7 @@ MAX_TOTAL_TIEBREAKER_BONUS = MAX_PRIMARY_SUBJECTIVE_BONUS + MAX_SECONDARY_BONUS
 
 DATA_DIRECTORY_NAME = "data"
 PUBLIC_STATE_FILENAME = "leaderboards_public.json"
+PUBLIC_TEXT_FILENAME = "leaderboards_public.txt"
 PRIVATE_STATE_FILENAME = "leaderboards_private.json"
 HISTORY_FILENAME = "leaderboard_history.private.jsonl"
 PUBLIC_ID_LIST_FILENAME = "repeater_ids_public.jsonl"
@@ -36,6 +39,13 @@ PACKAGE_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_DIRECTORY = PACKAGE_DIRECTORY.parent
 
 CATEGORY_BOARD_FAMILIES: Tuple[str, ...] = ("word", "single_run", "periodic")
+NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def default_node_id() -> str:
+    """A stable, human-readable identity for this compute source."""
+    hostname = socket.gethostname().strip()
+    return hostname if NODE_ID_PATTERN.fullmatch(hostname) else "local"
 
 
 def is_source_checkout() -> bool:
@@ -72,6 +82,10 @@ class Paths:
     @property
     def public_state(self) -> Path:
         return self._child(PUBLIC_STATE_FILENAME)
+
+    @property
+    def public_text(self) -> Path:
+        return self._child(PUBLIC_TEXT_FILENAME)
 
     @property
     def private_state(self) -> Path:
@@ -213,6 +227,7 @@ class Config:
     cpu: CpuConfig = field(default_factory=lambda: CpuConfig().resolved())
     gpu: GpuConfig = field(default_factory=GpuConfig)
     boards: BoardConfig = field(default_factory=BoardConfig)
+    node_id: str = field(default_factory=default_node_id)
 
     status_interval_seconds: float = 30.0
     checkpoint_interval_seconds: float = 30.0
@@ -241,6 +256,7 @@ class Config:
         cpu_workers: Optional[int] = None,
         gpu_enabled: bool = True,
         max_runtime_seconds: float = 0.0,
+        node_id: Optional[str] = None,
     ) -> "Config":
         directory = data_directory or default_data_directory()
         cpu = CpuConfig(requested_workers=cpu_workers or 0).resolved()
@@ -249,6 +265,7 @@ class Config:
             cpu=cpu,
             gpu=GpuConfig(enabled=gpu_enabled),
             max_runtime_seconds=max_runtime_seconds,
+            node_id=node_id or default_node_id(),
         )
 
     @property
@@ -256,6 +273,10 @@ class Config:
         return int(self.urgent_checkpoint_bits * RARITY_SCORE_PER_BIT)
 
     def validate(self) -> None:
+        if not NODE_ID_PATTERN.fullmatch(self.node_id):
+            raise ValueError(
+                "node ID must be 1-64 characters using letters, digits, '.', '_' or '-'"
+            )
         if self.cpu.workers < 1:
             raise ValueError("at least one CPU worker is required")
         if min(

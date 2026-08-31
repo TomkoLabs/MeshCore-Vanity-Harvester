@@ -268,6 +268,10 @@ class RestoreProgress:
 
     def __call__(self, phase: str, first: int, second: int) -> None:
         if phase == "start":
+            # One progress reporter may verify several merge inputs in turn.
+            # A large first input must not make a later small one announce.
+            self.announced = False
+            self.last_shown = time.monotonic()
             self.total = first
             slow = second
             # Estimate: the slow path dominates whenever it is used at all.

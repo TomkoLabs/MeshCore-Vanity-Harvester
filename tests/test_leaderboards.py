@@ -24,7 +24,15 @@ from meshcore_vanity.leaderboards import (
     validate_record,
 )
 from meshcore_vanity.scoring import analyze_public_key
-from meshcore_vanity.storage import checkpoint, restore_state, verify_integrity_hash
+from meshcore_vanity.storage import (
+    advance_compute_ledger,
+    checkpoint,
+    compute_ledger_totals,
+    compute_source_stats,
+    merge_compute_ledgers,
+    restore_state,
+    verify_integrity_hash,
+)
 
 
 def real_record(tag: str):
@@ -244,6 +252,18 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(len(restored[0]), len(unique))
         self.assertEqual(restored[3], 1234)
 
+    def test_checkpoint_records_which_node_did_the_work(self):
+        config = Config.create(
+            data_directory=Path(self.directory.name), node_id="kraken")
+        unique, hall, categories = self._seeded_boards()
+        checkpoint(unique, hall, categories, 1234, 5.0, 7, "new", False, config)
+        payload = json.loads(config.paths.private_state.read_text(encoding="utf-8"))
+        self.assertEqual(payload["node_id"], "kraken")
+        self.assertEqual(
+            payload["compute_sources"]["kraken"],
+            compute_source_stats(1234, 5.0, 7),
+        )
+
     def test_public_snapshot_contains_no_secrets(self):
         unique, hall, categories = self._seeded_boards()
         checkpoint(unique, hall, categories, 1, 1.0, 1, "new", False, self.config)
@@ -251,6 +271,8 @@ class PersistenceTests(unittest.TestCase):
         payload = json.loads(text)
         self.assertTrue(verify_integrity_hash(payload))
         self.assertFalse(payload["includes_secret_material"])
+        self.assertNotIn("node_id", payload)
+        self.assertNotIn("compute_sources", payload)
 
         sections = [payload["repeater_ids"], payload["vanity_hall_of_fame"]]
         sections.extend(payload["categories"].values())
@@ -266,12 +288,29 @@ class PersistenceTests(unittest.TestCase):
         for entry in private["vanity_hall_of_fame"]:
             self.assertNotIn(entry["private_key"], text)
 
+    def test_public_text_matches_the_hall_of_fame_rank_order(self):
+        unique, hall, categories = self._seeded_boards()
+        checkpoint(unique, hall, categories, 1, 1.0, 1, "new", False, self.config)
+
+        public_payload = json.loads(self.config.paths.public_state.read_text(encoding="utf-8"))
+        expected = [entry["public_key"] for entry in public_payload["vanity_hall_of_fame"]]
+        actual = self.config.paths.public_text.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(actual, expected)
+        self.assertTrue(all(len(public_key) == 64 for public_key in actual))
+
+    def test_empty_hall_writes_an_empty_public_text_file(self):
+        categories = empty_category_boards(self.config.boards)
+        checkpoint({}, {}, categories, 0, 0.0, 0, "new", False, self.config)
+        self.assertEqual(self.config.paths.public_text.read_text(encoding="utf-8"), "")
+
     def test_secret_files_are_not_world_readable(self):
         unique, hall, categories = self._seeded_boards()
         checkpoint(unique, hall, categories, 1, 1.0, 1, "new", False, self.config)
         for path in (self.config.paths.private_state, self.config.paths.private_key_map):
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, f"{path} is too permissive")
-        self.assertEqual(os.stat(self.config.paths.public_state).st_mode & 0o777, 0o644)
+        for path in (self.config.paths.public_state, self.config.paths.public_text):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
         self.assertEqual(os.stat(self.config.paths.data_directory).st_mode & 0o777, 0o700)
 
     def test_a_corrupted_snapshot_falls_back_to_the_backup(self):
@@ -307,6 +346,26 @@ class PersistenceTests(unittest.TestCase):
         for entry in lines:
             self.assertEqual(len(entry["public_key"]), 64)
             self.assertNotIn("private_key", entry)
+
+
+class ComputeLedgerTests(unittest.TestCase):
+    def test_a_session_advances_only_its_own_node(self):
+        baseline = {
+            "gx10": compute_source_stats(200, 20.0, 2),
+            "kraken": compute_source_stats(100, 10.0, 1),
+        }
+        advanced = advance_compute_ledger(baseline, "gx10", 50, 5.0, 1)
+        self.assertEqual(advanced["kraken"], baseline["kraken"])
+        self.assertEqual(advanced["gx10"], compute_source_stats(250, 25.0, 3))
+
+    def test_remerging_a_shared_baseline_does_not_double_count_it(self):
+        baseline = {
+            "gx10": compute_source_stats(200, 20.0, 2),
+            "kraken": compute_source_stats(100, 10.0, 1),
+        }
+        gx10_later = advance_compute_ledger(baseline, "gx10", 50, 5.0, 1)
+        merged = merge_compute_ledgers((baseline, gx10_later))
+        self.assertEqual(compute_ledger_totals(merged), (350, 35.0, 4))
 
 
 if __name__ == "__main__":

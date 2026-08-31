@@ -39,7 +39,7 @@ __all__ = ["SCORE_VERSION", "STATE_FORMAT_VERSION", "project_revision"]
 SCORE_VERSION = 9
 
 # Bump when the on-disk layout changes in a way readers must know about.
-STATE_FORMAT_VERSION = 7
+STATE_FORMAT_VERSION = 8
 
 
 def project_revision() -> Optional[str]:

@@ -10,6 +10,7 @@ This program generates real MeshCore identity keys. Possession of a saved privat
 - Back up private state only to encrypted storage with access controls.
 - Run the harvester under a dedicated, non-privileged account on shared systems.
 - Review permissions after copying files; the program enforces `0700` for the directory and `0600` for private files when it checkpoints.
+- Multi-node merges must use `leaderboards_private.json`, so transfer snapshots only over an encrypted channel or encrypted removable storage. Keep staging copies at mode `0600` and remove them after verifying the merge.
 - Public keys and the six-character repeater IDs are safe to share. Seeds and expanded private keys are not.
 
 The SHA-256 integrity fields detect accidental corruption; they are not signatures and do not protect against a malicious party who can modify the files.

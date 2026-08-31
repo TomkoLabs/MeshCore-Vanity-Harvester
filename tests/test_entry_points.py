@@ -86,6 +86,26 @@ class LauncherFailureMessageTests(unittest.TestCase):
         self.assertIn("untouched", result.stderr.lower(),
                       "the message should reassure that saved results survive")
 
+    def test_arguments_reach_the_module_in_this_checkout(self):
+        """A stale editable console script must not select another checkout."""
+        venv_bin = self.directory / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        python = venv_bin / "python"
+        python.write_text(
+            "#!/bin/sh\n"
+            "[ \"$1\" = \"-c\" ] && exit 0\n"
+            "printf '<%s>\\n' \"$@\"\n"
+        )
+        python.chmod(0o755)
+
+        result = sh(self.directory / "run.sh", "--node-id", "kraken", cwd=self.directory)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["<-m>", "<meshcore_vanity>", "<--node-id>", "<kraken>"],
+        )
+
 
 class InstallerSelfHealingTests(unittest.TestCase):
     """The installer must repair an environment, not trip over it."""
@@ -96,6 +116,13 @@ class InstallerSelfHealingTests(unittest.TestCase):
                       "install.sh reuses .venv without checking that it works")
         self.assertIn("rm -rf \"$VENV_DIR\"", text,
                       "install.sh has no way to rebuild a broken environment")
+
+    def test_it_reports_and_verifies_the_source_checkout(self):
+        text = INSTALL.read_text()
+        self.assertIn("project checkout:", text)
+        self.assertIn("source revision:", text)
+        self.assertIn("INSTALLED_PROJECT_DIR", text)
+        self.assertIn("instead of this checkout", text)
 
     def test_it_names_the_package_needed_when_venv_creation_fails(self):
         self.assertIn("python3-venv", INSTALL.read_text(),

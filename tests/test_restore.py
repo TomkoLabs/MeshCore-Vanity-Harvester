@@ -180,6 +180,16 @@ class ProgressReportingTests(unittest.TestCase):
         progress("start", 500, 0)
         self.assertIn("Verifying 500", "".join(sink.lines))
 
+    def test_a_small_merge_input_does_not_inherit_an_earlier_announcement(self):
+        sink = self.Sink()
+        progress = RestoreProgress(PLAIN, stream=sink, announce_threshold=100)
+        progress("start", 500, 0)
+        progress("done", 500, 0)
+        before = "".join(sink.lines)
+        progress("start", 2, 0)
+        progress("done", 2, 0)
+        self.assertEqual("".join(sink.lines), before)
+
 
 class InterruptHandlingTests(unittest.TestCase):
     """Ctrl+C and SIGTERM must work before the supervisor loop exists."""

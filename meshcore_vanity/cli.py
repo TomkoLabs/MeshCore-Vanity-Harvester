@@ -17,7 +17,7 @@ from typing import Deque, Dict, List, Optional, Sequence
 
 from . import SCORE_VERSION, project_revision
 from .catalog import catalog_summary
-from .config import Config, default_data_directory, worker_settings
+from .config import Config, PRIVATE_STATE_FILENAME, default_data_directory, worker_settings
 from .engine_cpu import start_worker
 from .engine_gpu import (
     KeygenEngine,
@@ -59,9 +59,14 @@ from .report import (
 from .scoring import analyze_public_key, quick_candidate, required_rarity_bits
 from .storage import (
     acquire_single_instance_lock,
+    advance_compute_ledger,
     append_history_event,
     checkpoint,
+    compute_source_stats,
+    merge_state_files,
+    read_compute_ledger,
     restore_state,
+    SnapshotMergeError,
 )
 
 RARITY_SCALE = 1_000_000
@@ -140,12 +145,21 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description="Continuously find and rank memorable MeshCore identities.",
         epilog="With no options it uses every engine available and resumes where it left off.",
     )
-    parser.add_argument("--version", action="store_true",
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--version", action="store_true",
                         help="print the Git revision of this checkout and exit")
-    parser.add_argument("--self-test", action="store_true",
+    action.add_argument("--self-test", action="store_true",
                         help="validate configuration and scoring, then exit")
-    parser.add_argument("--top", type=int, nargs="?", const=20, metavar="N",
+    action.add_argument("--top", type=int, nargs="?", const=20, metavar="N",
                         help="show the current leaderboards and exit (default 20 entries)")
+    action.add_argument(
+        "--merge",
+        type=Path,
+        nargs="+",
+        metavar="SOURCE",
+        help=("verify and merge private snapshots into --data-dir; the destination's "
+              "existing snapshot is included automatically"),
+    )
     parser.add_argument("--board", default="hall",
                         choices=("hall", "ids", "word", "single_run", "periodic", "all"),
                         help="which board --top shows (default: hall)")
@@ -159,6 +173,12 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         default=Path(os.environ["MESHCORE_VANITY_DATA_DIR"])
                         if os.environ.get("MESHCORE_VANITY_DATA_DIR") else None,
                         help="state directory (or set MESHCORE_VANITY_DATA_DIR)")
+    parser.add_argument(
+        "--node-id",
+        default=os.environ.get("MESHCORE_VANITY_NODE_ID"),
+        metavar="NAME",
+        help="stable compute-source name (default: hostname; or set MESHCORE_VANITY_NODE_ID)",
+    )
     parser.add_argument("--no-colour", "--no-color", dest="no_colour", action="store_true",
                         help="disable coloured output")
     return parser.parse_args(argv)
@@ -176,6 +196,7 @@ def config_from_arguments(arguments: argparse.Namespace) -> Config:
         cpu_workers=arguments.cpu_workers,
         gpu_enabled=not arguments.no_gpu,
         max_runtime_seconds=arguments.max_runtime or 0.0,
+        node_id=arguments.node_id,
     )
 
 
@@ -216,6 +237,101 @@ def show_leaderboards(config: Config, style: Style, limit: int, board: str) -> i
     print()
     print(ranking_footnote(style))
     print(style.dim(f"  Private keys for any of these: {config.paths.private_key_map}"))
+    return 0
+
+
+# --- Offline multi-node merge --------------------------------------------
+
+
+def _snapshot_path(source: Path) -> Path:
+    """Accept either a data directory or leaderboards_private.json itself."""
+    expanded = source.expanduser()
+    if expanded.is_dir():
+        expanded = expanded / PRIVATE_STATE_FILENAME
+    return expanded.resolve()
+
+
+def merge_leaderboards(config: Config, style: Style,
+                       requested_sources: Sequence[Path]) -> int:
+    """Merge transferred node snapshots into the destination data directory."""
+    destination = config.paths.private_state.resolve()
+    sources: List[Path] = []
+    seen = set()
+
+    # In-place aggregation is the convenient default: on Kraken, one command
+    # with GX10's transferred snapshot keeps Kraken's current work as an input.
+    candidates = ([destination] if destination.is_file() else []) + [
+        _snapshot_path(source) for source in requested_sources
+    ]
+    for source in candidates:
+        identity = str(source)
+        if identity not in seen:
+            seen.add(identity)
+            sources.append(source)
+
+    try:
+        lock_file = acquire_single_instance_lock(config.paths)
+    except RuntimeError as error:
+        print(f"Merge refused: {error}", file=sys.stderr)
+        return 3
+
+    install_early_interrupt_handlers()
+    try:
+        binary = find_binary(config.gpu, allow_build=False)
+        print(style.bold("Merging MeshCore vanity leaderboards"))
+        for source in sources:
+            print(style.dim(f"  Reading {source}"))
+        result = merge_state_files(
+            sources,
+            config.boards,
+            RestoreProgress(style),
+            make_pair_verifier(binary),
+        )
+        checkpoint(
+            result.unique,
+            result.hall,
+            result.categories,
+            result.attempts_total,
+            result.elapsed_total,
+            result.events_total,
+            "merged_snapshots",
+            result.statistics_approximate,
+            config,
+            keep_backup=True,
+            compute_sources=result.compute_sources,
+        )
+    except KeyboardInterrupt:
+        print("\nMerge stopped. Any completed snapshot write remains atomic and usable.",
+              file=sys.stderr)
+        return 130
+    except (OSError, SnapshotMergeError) as error:
+        print(f"Merge failed: {error}", file=sys.stderr)
+        return 4
+    finally:
+        try:
+            lock_file.close()
+        except OSError:
+            pass
+
+    print(style.good(f"Merged {result.source_count} private snapshots successfully."))
+    print("\n".join(labelled([
+        ("Destination", str(config.paths.data_directory)),
+        ("Distinct keys", f"{result.distinct_keys:,} verified from {result.input_keys:,} input keys"),
+        ("Boards", f"{len(result.unique):,} repeater IDs, {len(result.hall):,} hall entries"),
+        ("Compute sources", ", ".join(result.compute_sources)),
+        ("Combined work", f"{count(result.attempts_total)} CPU keys over {duration(result.elapsed_total)}"),
+    ], indent="  ")))
+    if result.discarded_keys:
+        print(style.warn(
+            f"  Ignored {result.discarded_keys:,} malformed or unverifiable input keys."))
+    if result.rescored_keys:
+        print(style.dim(
+            f"  Rescored {result.rescored_keys:,} keys from an older scoring model."))
+    if result.statistics_approximate:
+        print(style.dim(
+            "  Aggregate work statistics are approximate because a legacy snapshot had no node lineage."))
+    print(style.dim(
+        f"  Private key material is in {config.paths.private_state}; keep it secret."))
     return 0
 
 
@@ -281,6 +397,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(style.dim(f"  → {backend.remedy}"))
         return 0
 
+    if arguments.merge is not None:
+        return merge_leaderboards(config, style, arguments.merge)
+
     if arguments.top is not None:
         return show_leaderboards(config, style, arguments.top, arguments.board)
 
@@ -301,6 +420,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (unique, hall, categories, attempts_before, elapsed_before,
          leaderboard_events, recovery_source, statistics_approximate, rescored) = restore_state(
             config, RestoreProgress(style), make_pair_verifier(binary))
+        compute_ledger = read_compute_ledger(config.paths.private_state, config.node_id)
+        if not compute_ledger:
+            compute_ledger = {
+                config.node_id: compute_source_stats(
+                    attempts_before, elapsed_before, leaderboard_events)
+            }
+        events_before = leaderboard_events
         cutoff_value = current_cutoff(unique, hall, categories, config.boards)
 
         context = mp.get_context("spawn")
@@ -348,6 +474,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print()
     print("\n".join(labelled([
         ("Saving to", str(config.paths.data_directory)),
+        ("Compute source", config.node_id),
         ("Boards", f"{config.boards.top_repeater_ids} repeater IDs, "
                    f"{config.boards.top_vanity_keys} hall (max {config.boards.max_per_signature} per shape), "
                    f"{config.boards.top_category_keys} per category"),
@@ -405,9 +532,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         now_wall = time.monotonic()
         keep_backup = now_wall - last_backup >= config.backup_interval_seconds
         try:
+            ledger = advance_compute_ledger(
+                compute_ledger,
+                config.node_id,
+                attempts_total - attempts_before,
+                elapsed_total - elapsed_before,
+                leaderboard_events - events_before,
+            )
             checkpoint(unique, hall, categories, attempts_total, elapsed_total,
                        leaderboard_events, recovery_source, statistics_approximate,
-                       config, keep_backup=keep_backup)
+                       config, keep_backup=keep_backup, compute_sources=ledger)
         except OSError as error:
             checkpoint_failures += 1
             if checkpoint_failures in (1, 10) or checkpoint_failures % 100 == 0:

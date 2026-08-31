@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 VENV_DIR="$PROJECT_DIR/.venv"
 MIN_RUST_VERSION="1.85"
 RUN_AFTER_INSTALL=0
@@ -48,6 +48,12 @@ fail()  { printf '\033[31merror: %s\033[0m\n' "$*" >&2; exit 1; }
 # --- 0. sanity ------------------------------------------------------------
 
 [ "$(uname -s)" = "Linux" ] || warn "This installer targets Debian Linux; continuing anyway."
+
+info "project checkout: $PROJECT_DIR"
+if command -v git >/dev/null 2>&1 && git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree \
+    >/dev/null 2>&1; then
+  info "source revision: $(git -C "$PROJECT_DIR" describe --always --dirty --tags)"
+fi
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -145,6 +151,18 @@ venv_is_healthy || fail "the virtual environment in $VENV_DIR is not usable even
   || fail "could not install the Python dependencies (is this machine online?)"
 "$VENV_DIR/bin/python" -m pip install --quiet --no-deps -e "$PROJECT_DIR" \
   || fail "could not install the harvester into $VENV_DIR"
+
+INSTALLED_PROJECT_DIR="$(cd "$VENV_DIR" && "$VENV_DIR/bin/python" - <<'PY'
+from pathlib import Path
+import meshcore_vanity
+print(Path(meshcore_vanity.__file__).resolve().parent.parent)
+PY
+)"
+[ "$INSTALLED_PROJECT_DIR" = "$PROJECT_DIR" ] || fail "the environment imports MeshCore Vanity Harvester from
+       $INSTALLED_PROJECT_DIR
+    instead of this checkout:
+       $PROJECT_DIR
+    Remove a stale .venv symlink or renamed checkout, then run install.sh again."
 info "harvester installed into the environment"
 
 # --- 3. optional GPU backend ---------------------------------------------
@@ -216,9 +234,11 @@ fi
 # --- 4. verify ------------------------------------------------------------
 
 step "Verifying the installation"
-"$VENV_DIR/bin/meshcore-vanity-harvester" --self-test || fail "self-test failed"
+(cd "$PROJECT_DIR" && "$VENV_DIR/bin/python" -m meshcore_vanity --self-test) \
+  || fail "self-test failed"
 
-DATA_DIR="$("$VENV_DIR/bin/python" -c 'from meshcore_vanity.config import default_data_directory; print(default_data_directory())')"
+DATA_DIR="$(cd "$PROJECT_DIR" && "$VENV_DIR/bin/python" -c \
+  'from meshcore_vanity.config import default_data_directory; print(default_data_directory())')"
 
 step "Ready"
 cat <<MESSAGE
