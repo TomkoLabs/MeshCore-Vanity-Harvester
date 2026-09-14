@@ -1,10 +1,10 @@
 """Record construction, ranking and board insertion.
 
-Five complementary views are kept:
+Six complementary views are kept:
 
 * one best identity per six-character repeater ID;
 * an unrestricted hall of fame;
-* one board each for the word, single-run and periodic families.
+* one board each for the word, single-run, periodic and sequence families.
 
 The hall of fame additionally enforces a *diversity* rule. Rarity alone would
 happily fill five hundred slots with five hundred variations of the same shape,

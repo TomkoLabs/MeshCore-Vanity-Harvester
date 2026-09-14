@@ -8,6 +8,7 @@ result parsing and independent re-verification the way they actually run.
 from __future__ import annotations
 
 import os
+import subprocess
 import queue
 import sys
 import tempfile
@@ -90,6 +91,13 @@ def stub_binary() -> Path:
 
 
 class CapabilityDetectionTests(unittest.TestCase):
+    def test_only_current_policy_harvesting_is_enabled(self):
+        from unittest import mock
+        for help_text, expected in (("harvest", False), ("harvest policy-v2", True)):
+            result = subprocess.CompletedProcess([], 0, stdout=help_text, stderr="")
+            with mock.patch("meshcore_vanity.engine_gpu.subprocess.run", return_value=result):
+                self.assertEqual(detect_capabilities(stub_binary())["harvest"], expected)
+
     def test_a_gpu_build_is_recognised(self):
         with StubEnvironment("gpu"):
             capabilities = detect_capabilities(stub_binary())
@@ -175,6 +183,8 @@ class BackendRunTests(unittest.TestCase):
             resumed = KeygenEngine(stub_binary(), self.config, self.queue)
         self.assertGreater(len(resumed.progress["found_prefixes"]), 0)
         self.assertGreater(resumed.progress["matches_total"], 0)
+        self.assertTrue(resumed.progress["target_runs"])
+        self.assertEqual(resumed.progress["target_runs"], engine.progress["target_runs"])
 
     def test_repeated_failures_disable_the_backend_rather_than_spinning(self):
         config = replace(self.config, gpu=replace(QUICK_GPU, max_consecutive_failures=2,
@@ -246,8 +256,16 @@ class PairVerificationTests(unittest.TestCase):
             self.skipTest("mc-keygen is older than its sources; rebuild it: cargo build "
                           "--release --manifest-path mc-keygen/Cargo.toml")
         self.binary = REAL_BINARY
-        self.seed = bytes(range(32))
-        self.public = public_key_from_seed(self.seed).hex().upper()
+        # Restore tests need an eligible ID, as patternless keys are retired.
+        import hashlib
+        from meshcore_vanity.scoring import analyze_public_key
+        for index in range(100_000):
+            self.seed = hashlib.sha256(f"pair-verification-{index}".encode()).digest()
+            self.public = public_key_from_seed(self.seed).hex().upper()
+            if not self.public.startswith(("00", "FF")) and analyze_public_key(self.public)["score"] > 0:
+                break
+        else:
+            self.fail("could not create an eligible verification fixture")
         from meshcore_vanity.keys import meshcore_private_key_from_seed
         self.private = meshcore_private_key_from_seed(self.seed).hex().upper()
 

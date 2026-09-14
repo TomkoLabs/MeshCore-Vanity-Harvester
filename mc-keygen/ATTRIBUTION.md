@@ -36,6 +36,18 @@ Together that removed about 111 of 348 crates from the dependency graph.
 
 ## What was added
 
+- Prefix-pattern CPU/CUDA harvesting in `src/harvest.rs`, `src/gpu_harvest.rs`,
+  `cuda/harvest_filter.h` and `cuda/harvest_kernel.cu`. The new kernel reuses the
+  existing field arithmetic and Montgomery inversion code; the original
+  `vanity_kernel.cu` is unchanged. Independent random thread starts and one
+  retained result per chain prevent related private-key outputs.
+- A small replacement `build.rs` compiles the shared C screening filter for
+  native CPU use with the `cc` build dependency. CUDA compiles the identical
+  header with NVRTC. Runtime compilation targets the detected GPU architecture.
+- A JSON Lines protocol with actual tested-key counts, bounded overflow replay,
+  graceful stdin shutdown, and a statistics-only benchmark mode. Device/host
+  harvesting verification runs automatically before a GPU search.
+
 - A plain-text progress line on stderr, so the tool is still usable by hand
   without a terminal UI.
 - `verify-pairs`, a batch verification mode. The harvester re-derives every

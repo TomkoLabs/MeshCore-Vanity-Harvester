@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import shutil
 from dataclasses import dataclass
@@ -25,7 +26,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from . import SCORE_VERSION, STATE_FORMAT_VERSION, project_revision
 from .config import BoardConfig, Config, Paths, PUBLIC_KEY_HEX_LENGTH
-from .keys import normalize_hex
+from .keys import normalize_hex, public_key_from_meshcore_private
+from .importing import collect_private_candidates, prepare_private_candidate, private_text
 from .leaderboards import (
     Board,
     CategoryBoards,
@@ -69,6 +71,7 @@ class MergeResult:
     discarded_keys: int
     rescored_keys: int
     statistics_approximate: bool
+    ineligible_keys: int = 0
 
 
 def utc_now() -> str:
@@ -90,13 +93,13 @@ def add_integrity_hash(payload: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def verify_integrity_hash(payload: Mapping[str, Any]) -> bool:
-    expected = payload.get("integrity_sha256")
-    if not isinstance(expected, str) or len(expected) != 64:
+    expected = normalize_hex(payload.get("integrity_sha256"), 64)
+    if expected is None:
         return False
     unsigned = dict(payload)
     unsigned.pop("integrity_sha256", None)
     actual = hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
-    return hmac.compare_digest(actual, expected)
+    return hmac.compare_digest(actual, expected.lower())
 
 
 # --- Atomic writes ---------------------------------------------------------
@@ -193,7 +196,8 @@ def _nonnegative_int(value: Any) -> int:
 
 def _nonnegative_float(value: Any) -> float:
     try:
-        return max(0.0, float(value))
+        converted = float(value)
+        return max(0.0, converted) if math.isfinite(converted) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -530,6 +534,10 @@ def _insert_restored(
     categories: CategoryBoards,
     config: BoardConfig,
 ) -> None:
+    # A prior scorer may have rewarded a pattern buried inside an ordinary ID.
+    # Keep its material in the migration archive, not on the current boards.
+    if int(record["score"]) <= 0:
+        return
     insert_unique(unique, record, config.top_repeater_ids)
     insert_by_public_key(hall, record, config.top_vanity_keys, config.max_per_signature)
     insert_category(categories, record, config)
@@ -635,7 +643,8 @@ def load_state_file(path: Path, config: BoardConfig, progress=None, verifier=Non
         return None
     records = _collect_records(payload)
     unique, hall, categories, rescored = _restore_records(records, config, progress, verifier)
-    if not unique and not hall:
+    empty_snapshot = not records and payload.get("includes_secret_material") is True
+    if not unique and not hall and not rescored and not empty_snapshot:
         return None
     return (
         unique, hall, categories,
@@ -646,112 +655,206 @@ def load_state_file(path: Path, config: BoardConfig, progress=None, verifier=Non
     )
 
 
+MAX_IMPORT_BYTES = 64 * 1024 * 1024
+
+
+def _parse_import_text(text: str) -> Any:
+    """JSON, JSON Lines or one expanded key / MeshCore command per line."""
+    if private_text(text):
+        return text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        rows = []
+        for number, line in enumerate(text.splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if private_text(line):
+                rows.append(line)
+            else:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Never include the line or decoder exception: it may be a key.
+                    raise ValueError(f"invalid JSON or private-key line {number}") from None
+        if not rows:
+            raise ValueError("empty input")
+        return rows
+
+
+def _check_import_hashes(payload: Any) -> None:
+    stack = [payload]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            if "integrity_sha256" in value and not verify_integrity_hash(value):
+                raise ValueError("no valid integrity-hashed snapshot (checksum mismatch)")
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+
+
+def _read_import_file(path: Path):
+    """Permit legacy unhashed files, but never downgrade a failed hash check."""
+    reason = "file or backup could not be read"
+    for candidate in (path, Paths.backup(path)):
+        try:
+            with candidate.open("rb") as handle:
+                content = handle.read(MAX_IMPORT_BYTES + 1)
+            if len(content) > MAX_IMPORT_BYTES:
+                raise ValueError("input exceeds the 64 MiB import limit")
+            payload = _parse_import_text(content.decode("utf-8-sig"))
+            _check_import_hashes(payload)
+            if isinstance(payload, dict) and payload.get("includes_secret_material") is False:
+                raise SnapshotMergeError(f"{path}: public snapshots cannot be merged; supply private material")
+            return payload, hashlib.sha256(content).hexdigest()
+        except OSError:
+            continue
+        except (UnicodeError, RecursionError):
+            reason = "invalid UTF-8 or excessive JSON nesting"
+        except ValueError as error:
+            if isinstance(error, SnapshotMergeError):
+                raise
+            reason = str(error)
+    raise SnapshotMergeError(f"{path}: {reason}")
+
+
+def _verify_import_candidates(candidates, progress=None, verifier=None):
+    """Verify every distinct material/public association before any board limits."""
+    prepared = []
+    for candidate in candidates:
+        try:
+            prepared.append(prepare_private_candidate(candidate))
+        except (ValueError, TypeError, OverflowError):
+            prepared.append(None)
+    pairs = sorted({(raw["public_key"], raw["private_key"]) for raw in prepared
+                    if raw and raw["public_key"] and not raw["seed"]})
+    proven = set()
+    if verifier and pairs:
+        try:
+            proven = set(verifier(pairs))
+        except Exception:  # verification acceleration is optional
+            pass
+    slow = sum(1 for raw in prepared if raw and not raw["seed"] and
+               (raw["public_key"], raw["private_key"]) not in proven)
+    if progress:
+        progress("start", len(candidates), slow)
+    verified = []
+    discarded = 0
+    derived_by_private = {}
+    for index, raw in enumerate(prepared, 1):
+        validated = None
+        if raw:
+            try:
+                if raw["public_key"] is None:
+                    private = raw["private_key"]
+                    if private not in derived_by_private:
+                        derived_by_private[private] = public_key_from_meshcore_private(
+                            bytes.fromhex(private)).hex().upper()
+                    raw["public_key"] = derived_by_private[private]
+                    # This pair was just derived by the independent reference
+                    # implementation; do not perform the same work twice.
+                    proven.add((raw["public_key"], private))
+                validated = validate_record(raw, proven)
+            except (ValueError, TypeError, OverflowError):
+                pass
+        if validated is None:
+            discarded += 1
+        else:
+            verified.append(validated)
+        if progress:
+            progress("step", index, len(candidates))
+    if progress:
+        progress("done", len(candidates), slow)
+    return verified, discarded
+
+
+def archive_merge_destination(path: Path) -> None:
+    """Keep the full pre-merge input, including keys retired by current scoring.
+
+    Unlike startup rescoring, an explicit merge accepts unhashed files and
+    arbitrary layouts. Wrap those inputs in a hashed private archive so later
+    checkpoints cannot overwrite their only recoverable copy.
+    """
+    if not path.is_file() and not Paths.backup(path).is_file():
+        return
+    payload, digest = _read_import_file(path)
+    lineage = dict(payload) if isinstance(payload, dict) else {}
+    lineage.setdefault("integrity_sha256", digest)
+    preserved = add_integrity_hash({
+        "includes_secret_material": True, "imported_payload": payload,
+        "compute_sources": compute_ledger_from_payload(lineage),
+        "statistics_approximate": bool(lineage.get("statistics_approximate", False))
+            or not bool(normalize_compute_ledger(lineage.get("compute_sources"))),
+    })
+    fingerprint = preserved["integrity_sha256"][:16]
+    archive = path.parent / f"before_merge_{fingerprint}.private.json"
+    if not archive.exists():
+        atomic_write_json(archive, preserved, private=True, keep_backup=False)
+
+
 def merge_state_files(
     source_paths: Sequence[Path],
     config: BoardConfig,
     progress=None,
     verifier=None,
 ) -> MergeResult:
-    """Verify and combine any number of private snapshots.
+    """Discover, verify and rescore private material from current/legacy files.
 
-    Each input is rebuilt under the current scorer before its records enter the
-    union. Board insertion is then applied once to the full union, which makes
-    the result identical to one harvester having seen all retained candidates.
+    Apply board limits only after unioning all verified candidates. This also
+    prevents a bad duplicate, old board layout or missing public field from
+    hiding another valid private key in the same source.
     """
     if not source_paths:
-        raise SnapshotMergeError("no private snapshots were supplied")
-
+        raise SnapshotMergeError("no private files were supplied")
     candidates_by_key: Dict[str, Record] = {}
     ledgers: List[ComputeLedger] = []
-    input_keys = 0
-    discarded_keys = 0
-    legacy_statistics = False
-    statistics_approximate = False
-
+    input_keys = discarded_keys = 0
+    legacy_statistics = statistics_approximate = False
     for source_path in source_paths:
-        payload = read_verified_json(source_path)
-        if payload is None:
-            raise SnapshotMergeError(
-                f"{source_path}: no valid integrity-hashed snapshot or backup"
-            )
-        if payload.get("includes_secret_material") is False:
-            raise SnapshotMergeError(
-                f"{source_path}: public snapshots cannot be merged; use leaderboards_private.json"
-            )
-
-        records = _collect_records(payload)
-        distinct_input_keys = {
-            key for key in (
-                normalize_hex(record.get("public_key"), PUBLIC_KEY_HEX_LENGTH)
-                for record in records
-            ) if key is not None
-        }
-        if not distinct_input_keys:
-            raise SnapshotMergeError(f"{source_path}: snapshot contains no private leaderboard records")
-
-        source_unique, source_hall, source_categories, _rescored = _restore_records(
-            records, config, progress, verifier)
-        validated_by_key: Dict[str, Record] = {}
-        source_boards = [source_unique, source_hall, *source_categories.values()]
-        for board in source_boards:
-            for record in board.values():
-                public_key = str(record["public_key"])
-                existing = validated_by_key.get(public_key)
-                if existing is None or (
-                    existing.get("seed") is None and record.get("seed") is not None
-                ) or record_sort_key(record) > record_sort_key(existing):
-                    validated_by_key[public_key] = record
-
-        if not validated_by_key:
+        payload, digest = _read_import_file(source_path)
+        metadata = payload if isinstance(payload, dict) else {}
+        candidates = collect_private_candidates(payload)
+        empty_snapshot = (not candidates and metadata.get("includes_secret_material") is True
+                          and verify_integrity_hash(metadata) and not _collect_records(payload))
+        if not candidates and not empty_snapshot:
+            raise SnapshotMergeError(f"{source_path}: no private key material found; public-only files cannot be imported")
+        records, discarded = _verify_import_candidates(candidates, progress, verifier)
+        if candidates and not records:
             raise SnapshotMergeError(f"{source_path}: no key pair passed verification")
-
-        input_keys += len(distinct_input_keys)
-        discarded_keys += len(distinct_input_keys - set(validated_by_key))
-        for public_key, record in validated_by_key.items():
+        input_keys += len(candidates)
+        discarded_keys += discarded
+        for record in records:
+            public_key = str(record["public_key"])
             existing = candidates_by_key.get(public_key)
-            if existing is None or (
-                existing.get("seed") is None and record.get("seed") is not None
-            ) or record_sort_key(record) > record_sort_key(existing):
+            if existing is None or (existing.get("seed") is None and record.get("seed") is not None):
                 candidates_by_key[public_key] = record
-
-        has_ledger = bool(normalize_compute_ledger(payload.get("compute_sources")))
-        legacy_statistics = legacy_statistics or not has_ledger
-        ledgers.append(compute_ledger_from_payload(payload))
-        statistics_approximate = statistics_approximate or bool(
-            payload.get("statistics_approximate", False))
+        has_ledger = bool(normalize_compute_ledger(metadata.get("compute_sources")))
+        legacy_statistics |= not has_ledger
+        # Use a stable content fingerprint for older files that have no hash or
+        # node identity, so importing the same file twice cannot add its work twice.
+        lineage = dict(metadata)
+        lineage.setdefault("integrity_sha256", digest)
+        ledgers.append(compute_ledger_from_payload(lineage))
+        statistics_approximate |= bool(metadata.get("statistics_approximate", False)) or not bool(metadata)
 
     unique: Board = {}
     hall: Board = {}
     categories = empty_category_boards(config)
     for record in candidates_by_key.values():
         _insert_restored(dict(record), unique, hall, categories, config)
-
     compute_sources = merge_compute_ledgers(ledgers)
     attempts, elapsed, events = compute_ledger_totals(compute_sources)
-    rescored = sum(
-        1 for record in candidates_by_key.values()
-        if record.get("rescored_from_version") is not None
-    )
-    # Pre-v8 files have only one aggregate counter. It is exact by itself, but
-    # when several such snapshots meet there is no lineage with which to prove
-    # that they do not share history.
-    statistics_approximate = statistics_approximate or (
-        legacy_statistics and len(source_paths) > 1
-    )
     return MergeResult(
-        unique=unique,
-        hall=hall,
-        categories=categories,
-        compute_sources=compute_sources,
-        attempts_total=attempts,
-        elapsed_total=elapsed,
-        events_total=events,
-        source_count=len(source_paths),
-        input_keys=input_keys,
-        distinct_keys=len(candidates_by_key),
-        discarded_keys=discarded_keys,
-        rescored_keys=rescored,
-        statistics_approximate=statistics_approximate,
+        unique=unique, hall=hall, categories=categories, compute_sources=compute_sources,
+        attempts_total=attempts, elapsed_total=elapsed, events_total=events,
+        source_count=len(source_paths), input_keys=input_keys,
+        distinct_keys=len(candidates_by_key), discarded_keys=discarded_keys,
+        rescored_keys=sum(record.get("rescored_from_version") is not None
+                          for record in candidates_by_key.values()),
+        statistics_approximate=statistics_approximate or (legacy_statistics and len(source_paths) > 1),
+        ineligible_keys=sum(int(record["score"]) <= 0 for record in candidates_by_key.values()),
     )
 
 
@@ -788,12 +891,27 @@ def recover_from_history(paths: Paths, config: BoardConfig, progress=None, verif
     return unique, hall, categories, attempts, 0.0, events, rescored
 
 
+def archive_prior_scores(path: Path) -> None:
+    """Preserve old private snapshots once, before rescoring can retire keys."""
+    payload = read_verified_json(path)
+    if payload is None:
+        return
+    records = _collect_records(payload)
+    if not any(record.get("score_version") != SCORE_VERSION for record in records):
+        return
+    fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    archive = path.parent / f"before_score_{SCORE_VERSION}_{fingerprint}.private.json"
+    if not archive.exists():
+        atomic_write_json(archive, payload, private=True, keep_backup=False)
+
+
 def restore_state(config: Config, progress=None, verifier=None):
     """Return boards plus provenance: (unique, hall, categories, attempts,
     elapsed, events, source, statistics_approximate, rescored_count)."""
     board_config = config.boards
     # Only the private snapshot can be restored from: the public one carries no
     # key material, so a record from it could never be validated or used.
+    archive_prior_scores(config.paths.private_state)
     loaded = load_state_file(config.paths.private_state, board_config, progress, verifier)
     if loaded is not None:
         unique, hall, categories, attempts, elapsed, events, rescored = loaded

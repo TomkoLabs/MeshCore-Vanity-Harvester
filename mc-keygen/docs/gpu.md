@@ -1,43 +1,71 @@
-# GPU Acceleration
+# GPU acceleration
 
-## Performance
+Build with `cargo build --release --features cuda --locked`. The locked CUDA
+dependencies require Rust 1.88+. Runtime use needs NVIDIA's driver and NVRTC
+libraries. The `cuda-12040` cudarc feature selects driver API bindings; NVRTC
+must also understand the GPU's actual architecture. The program selects the
+detected compute capability at runtime.
 
-### NOTE: as of 5/11 these numbers are out of date
+## Prefix harvesting
 
-Measured throughput on real hardware:
+The supervisor generates a screening policy and invokes `mc-keygen harvest`.
+The first six characters must show a desirable ID. Leading runs, sequences,
+periodic units, palindromes, words, word extensions and arbitrary catalog-word
+chains are then screened from character zero. Buried and suffix-only patterns
+are excluded. There is no 16-character span ceiling: qualifying continuations
+can reach the end of the 64-character key. Policy v2 is advertised in backend
+help; older binaries use the optional exact-prefix path until rebuilt.
 
-| | Throughput | Hardware |
-|-|------------|----------|
-| **CPU** | ~1.3M keys/sec | AMD Ryzen 9 7950X3D (32 threads) |
-| **GPU** | ~68M keys/sec | NVIDIA RTX 4090 (24GB) |
+Each GPU thread starts with an independent OS-random clamped scalar, uses
+`+8B` additions and Montgomery batch inversion for up to 256 candidates, and
+retires at its first hit. Only one private key is retained per chain, avoiding
+related-scalar outputs. A three-byte visible-ID gate runs before computing the
+x-coordinate sign bit; most candidates avoid that extra field multiplication.
+Survivors receive their complete sign encoding before long-prefix screening.
+Device buffers persist between launches.
 
-The GPU is roughly **50x faster** than the CPU on this hardware. The speedup comes from running the full Ed25519 pipeline across thousands of GPU threads in parallel.
+The output buffer holds 4,096 matches. Overflow discards the incomplete output
+and replays the same starts in smaller disjoint thread groups. All first hits
+are recovered without double-counting useful attempts. Replay work is reported
+separately. Every emitted pair is independently verified in Rust; Python
+re-derives accepted pairs and decides their ranking.
 
-## Building with CUDA
+A mandatory GPU startup self-test checks multiple threads against CPU results,
+including chain advancement, sign bits, exact counters and forced overflow.
+The original field arithmetic in `vanity_kernel.cu` is unchanged.
+
+## Measurement
+
+From the project root:
 
 ```bash
-cargo build --release --features cuda
+.venv/bin/python scripts/benchmark_harvest.py --seconds 60
 ```
 
-Requires the NVIDIA CUDA Toolkit to be installed. The CUDA kernel is compiled at runtime via NVRTC, so `nvrtc` and `cuda` shared libraries must be on PATH.
+This invokes `harvest --benchmark`: statistics only, no private keys printed.
+Divide the final `attempts` by `elapsed_secs` for useful keys/second. Native
+initialization is excluded. The measurement includes prefix filtering, random
+starts, transfers, Rust verification and overflow recovery. It excludes Python
+ranking and persistence.
 
-The `cudarc` dependency is configured for CUDA 13.1 by default. To target a different CUDA version, change the `cuda-13010` feature in `Cargo.toml` to match your installation (e.g. `cuda-12060` for CUDA 12.6).
+Historical exact-prefix rates do not measure this workload. The anchored
+filter stops at the first mismatch and catches generic families
+outside a fixed target list. It avoids the former all-position scans; the
+end-to-end gain still depends on how much time the device spends on curve math.
+Benchmark the same policy on each machine. See
+[search strategy](../../docs/search-strategy.md) for probabilities and hardware.
 
-## How GPU mode works
+## Legacy search and verification
 
-When `--gpu-only` (or hybrid) is selected, the entire keygen pipeline runs on the GPU. A single host thread loops: launch kernel batch, sync, check for match, repeat. The TUI progress display works identically for both CPU and GPU modes.
+Exact prefixes remain available with `mc-keygen PREFIX... --gpu-only` or the
+supervisor's `--prefix-campaigns`. Its first-match kernel can stop partway
+through a launch while reporting the full batch size. Short-prefix statistics
+are therefore not exact throughput measurements.
 
-Each `GpuSearcher` draws a fresh 32-byte `start_scalar` from the OS CSPRNG and advances it by `8 * keys_checked` between batches. Per launch, every thread runs **one** `ge_scalarmult_base` on `start_scalar + 8 * tid` to derive its starting point `A`, then iterates `ITERS_PER_THREAD = 256` cheap point additions of `8B` (using `base[0][7] = 8B` as a `ge_precomp`) — each iteration produces a fresh candidate pubkey from `A` and checks the prefix. To amortize the expensive `fe_invert` needed for point compression, the kernel uses **Montgomery batch inversion** with `B = 16`: one inversion per 16 points instead of one per point. On every prefix hit the kernel writes back the scalar and pubkey, and the host runs a defensive `scalar·B == pubkey` check via curve25519-dalek before accepting the match.
+`mc-keygen A --gpu-only --verify` checks the original chain arithmetic. Prefix
+harvesting always performs its additional device self-test automatically.
 
-The Ed25519 field arithmetic uses the ref10 implementation (radix-2^25.5, int32[10] limbs) from [solana-perf-libs](https://github.com/solana-labs/solana-perf-libs), which is a CUDA adaptation of the [SUPERCOP](https://bench.cr.yp.to/supercop.html) reference code. Scalar multiplication uses windowed lookup tables with 32 precomputed basepoint multiples.
-
-## Verification
-
-Use `--verify` to cross-check GPU-generated keys against the CPU implementation. This is useful for validating correctness after modifying the CUDA kernel.
-
-Use `--benchmark <SECS>` to run a separate `vanity_count_matches` kernel that never exits early on a hit. It atomically tallies every match over the given duration and compares the observed count against the expected count implied by the reported keys/sec rate — a sanity check that the reported throughput isn't inflated by mid-launch early exits. Works on both the CUDA and Metal backends.
-
-## Sources
-
-- [solana-perf-libs](https://github.com/solana-labs/solana-perf-libs) — CUDA Ed25519 field arithmetic (ref10)
-- [cudarc](https://github.com/coreylowman/cudarc) — safe Rust bindings for the CUDA driver API
+Validation here covers Rust CPU/CUDA builds, differential filter tests, host
+execution of the harvest kernel, and NVRTC compilation for compute 8.6 and
+12.1. No GPU was available for actual device execution or performance
+measurement. The runtime self-test must pass on the user's GPU.

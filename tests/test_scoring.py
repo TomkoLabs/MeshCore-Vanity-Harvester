@@ -35,6 +35,28 @@ def score(prefix: str) -> int:
 
 
 class RarityModelTests(unittest.TestCase):
+    def test_long_word_tails_sequences_and_runs_keep_their_full_span(self):
+        for prefix, kind in (("DEADBEEFFFFF", "word_extension"),
+                             ("123456789ABC", "sequence"),
+                             ("222222222222", "single_run")):
+            with self.subTest(prefix=prefix):
+                analysis = analyze_public_key(padded(prefix))
+                self.assertEqual(analysis["pattern_kind"], kind)
+                self.assertGreaterEqual(analysis["pattern_length"], len(prefix))
+
+    def test_compound_tail_earns_four_bits_per_additional_character(self):
+        def analyze(tail):
+            return analyze_public_key(("C0FFEEBEEF" + "F" * tail + "0"
+                                       + hashlib.sha256(b"tail-test").hexdigest().upper())[:64])
+
+        short, long = analyze(4), analyze(5)
+        self.assertEqual(short["pattern_kind"], "compound_extension")
+        self.assertEqual(short["pattern_length"], 14)
+        self.assertEqual(long["pattern_length"], 15)
+        self.assertAlmostEqual(long["rarity_bits"] - short["rarity_bits"], 4.0)
+        self.assertEqual(short["pattern_family"], "word")
+        self.assertEqual(short["pattern_signature"], long["pattern_signature"])
+
     def test_one_rarity_bit_outranks_every_aesthetic_bonus(self):
         self.assertLess(MAX_TOTAL_TIEBREAKER_BONUS, RARITY_SCORE_PER_BIT)
 
@@ -67,12 +89,40 @@ class RarityModelTests(unittest.TestCase):
         neutral = analyze_public_key(padded("777777777777"))["rarity_bits"]
         self.assertAlmostEqual(curated, neutral, places=6)
 
-    def test_position_penalty_applies_away_from_the_prefix(self):
-        """The same word is less surprising when the key offered 58 places for it."""
+    def test_buried_words_earn_nothing(self):
         filler = hashlib.sha256(b"position-test").hexdigest().upper()
         at_prefix = analyze_public_key(("DEADBEEF" + filler * 2)[:64])["rarity_bits"]
         buried = analyze_public_key(("9C3" + "DEADBEEF" + filler * 2)[:64])["rarity_bits"]
         self.assertGreater(at_prefix, buried)
+        self.assertEqual(buried, 0)
+
+    def test_ordinary_ids_cannot_be_rescued_by_long_tails_or_large_units(self):
+        for key in (padded("A73C91")[:40] + "2" * 24,
+                    padded("A73C91DEADBEEFDEADBEEF"),
+                    padded("A73C91" * 8),
+                    "A73C91" + "2" * 52 + "19C37A"):
+            with self.subTest(key=key):
+                self.assertEqual(analyze_public_key(key)["score"], 0)
+                self.assertFalse(quick_candidate(key, 1_000_000))
+
+    def test_disconnected_tail_does_not_increase_a_good_ids_score(self):
+        ordinary = padded("C0FFEE91")
+        fancy_tail = ordinary[:40] + "2" * 24
+        self.assertEqual(analyze_public_key(ordinary), analyze_public_key(fancy_tail))
+
+    def test_visible_words_and_shapes_qualify_before_long_prefix_bonuses(self):
+        for prefix in ("DEADBEEF", "DEAD91", "12345A", "ABCABC", "ABABAB",
+                       "111222", "112233", "123321", "514514", "1111AB"):
+            analysis = analyze_public_key(padded(prefix))
+            self.assertGreater(analysis["score"], 0, prefix)
+            self.assertEqual(analysis["pattern_start"], 0)
+
+    def test_full_length_prefixes_and_partial_final_units_are_retained(self):
+        for prefix in ("2" * 64, "DEADBEEF" * 8, "C0FFEEBEEF" + "F" * 54,
+                       "AB" * 31 + "A"):
+            analysis = analyze_public_key(padded(prefix))
+            self.assertGreaterEqual(analysis["pattern_length"], len(prefix))
+            self.assertTrue(quick_candidate(padded(prefix), analysis["score"]))
 
     def test_reference_class_counts_are_sane(self):
         self.assertGreaterEqual(words_of_length(6), 1)
@@ -104,6 +154,16 @@ class RarityModelTests(unittest.TestCase):
 
 class QuickFilterTests(unittest.TestCase):
     """The pre-filter's one hard contract: no false negatives, ever."""
+
+    def test_compound_tails_survive_at_their_own_score(self):
+        rng = random.Random(8912)
+        words = list(HEX_WORDS)
+        for _ in range(300):
+            prefix = rng.choice(words) + rng.choice(words)
+            prefix += prefix[-1] * rng.randint(1, 24)
+            key = padded(prefix)
+            actual = analyze_public_key(key)["score"]
+            self._assert_admits(key, (actual, actual - 1, actual // 2))
 
     def _assert_admits(self, key: str, cutoffs):
         actual = int(analyze_public_key(key)["score"])

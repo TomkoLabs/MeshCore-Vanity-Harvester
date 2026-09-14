@@ -19,7 +19,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 VENV_DIR="$PROJECT_DIR/.venv"
-MIN_RUST_VERSION="1.85"
+MIN_RUST_VERSION="1.88"
 RUN_AFTER_INSTALL=0
 FORCE_CPU=0
 ASSUME_YES=0
@@ -219,7 +219,7 @@ else
 
     if rust_version_ok; then
       info "building mc-keygen with CUDA support (this takes a few minutes)"
-      if cargo build --release --features cuda \
+      if cargo build --release --features cuda --locked \
           --manifest-path "$PROJECT_DIR/mc-keygen/Cargo.toml"; then
         info "GPU backend built"
       else

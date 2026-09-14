@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from meshcore_vanity.scoring import analyze_public_key  # noqa: E402
 
-SAMPLES = int(os.environ.get("CALIBRATION_SAMPLES", "60000"))
+SAMPLES = int(os.environ.get("CALIBRATION_SAMPLES", "400000"))
 MAX_OPTIMISTIC_BITS = 2.5
 MIN_HITS = 30
 HEX = "0123456789ABCDEF"
@@ -37,6 +37,7 @@ def main() -> int:
             per_family[analysis["pattern_family"]].append(analysis["rarity_bits"])
 
     failures = []
+    measured = 0
     for family, values in sorted(per_family.items()):
         claims = sorted({round(v * 4) / 4 for v in values if v >= 6.0})
         worst = None
@@ -50,6 +51,7 @@ def main() -> int:
             print(f"  {family:<12} not enough samples to judge")
             continue
         status = "ok" if worst <= MAX_OPTIMISTIC_BITS else "TOO OPTIMISTIC"
+        measured += 1
         print(f"  {family:<12} worst gap {worst:+.2f} bits   {status}")
         if worst > MAX_OPTIMISTIC_BITS:
             failures.append((family, worst))
@@ -58,7 +60,10 @@ def main() -> int:
         print("\nCalibration regression: " + ", ".join(f"{f} at {g:+.2f} bits" for f, g in failures))
         print("Re-fit FAMILY_CALIBRATION_BITS with scripts/calibrate.py.")
         return 1
-    print("\nAll families within tolerance.")
+    if not measured:
+        print("\nNo claims had enough observations; increase CALIBRATION_SAMPLES.")
+        return 1
+    print("\nAll measurable claims within tolerance; unmeasured families remain unvalidated.")
     return 0
 
 

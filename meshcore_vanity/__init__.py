@@ -36,7 +36,7 @@ __all__ = ["SCORE_VERSION", "STATE_FORMAT_VERSION", "project_revision"]
 
 # Bump when analyze_public_key() can return a different score for the same key.
 # Saved records carrying an older value are rescored on load.
-SCORE_VERSION = 9
+SCORE_VERSION = 11
 
 # Bump when the on-disk layout changes in a way readers must know about.
 STATE_FORMAT_VERSION = 8

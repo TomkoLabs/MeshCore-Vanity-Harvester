@@ -32,6 +32,9 @@ serde_json = "1"
 # needs no CUDA toolkit; the kernel is compiled by NVRTC when a search starts.
 cudarc = { version = "0.19", optional = true, features = ["cuda-12040"] }
 
+[build-dependencies]
+cc = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

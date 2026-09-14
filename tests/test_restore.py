@@ -10,6 +10,8 @@ trace if you pressed Ctrl+C. These tests pin down the fixes.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import signal
 import tempfile
 import time
@@ -18,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 from meshcore_vanity.cli import install_early_interrupt_handlers
+from meshcore_vanity import SCORE_VERSION
 from meshcore_vanity.config import Config
 from meshcore_vanity.keys import (
     meshcore_private_key_from_seed,
@@ -43,11 +46,17 @@ SLOW_PATH = "meshcore_vanity.leaderboards.public_key_from_meshcore_private"
 
 
 def genuine_record(tag: str):
-    seed = hashlib.sha256(tag.encode("ascii")).digest()
-    public_key_hex = public_key_from_seed(seed).hex().upper()
-    if public_key_hex.startswith(("00", "FF")):
-        return None
-    return make_cpu_record(seed, public_key_hex, analyze_public_key(public_key_hex), 0.0, 0)
+    """Find a genuine pair with a prefix pattern for persistence/board tests."""
+    for suffix in range(100_000):
+        seed = hashlib.sha256(f"{tag}-{suffix}".encode("ascii")).digest()
+        public_key_hex = public_key_from_seed(seed).hex().upper()
+        if public_key_hex.startswith(("00", "FF")):
+            continue
+        analysis = analyze_public_key(public_key_hex)
+        if analysis["score"] > 0:
+            return make_cpu_record(seed, public_key_hex, analysis, 0.0, 0)
+    raise AssertionError("could not create a prefix-pattern test identity")
+
 
 
 class VerificationPathTests(unittest.TestCase):
@@ -273,8 +282,32 @@ class PatternlessRecordTests(unittest.TestCase):
 
     def test_the_scorer_gives_a_patternless_key_zero(self):
         analysis = analyze_public_key("9C3B7A1E5D8F204C6B9E1A7D3F85206C4E9B1D7A3F58206C4E9B1D7A3F58206C")
-        self.assertIn(analysis["pattern_kind"], ("none", "palindrome", "word",
-                                                 "periodic", "single_run", "sequence"))
+        self.assertEqual(analysis["score"], 0)
+
+    def test_rescoring_archives_retired_material_and_preserves_empty_board_totals(self):
+        seed = hashlib.sha256(b"ordinary-legacy-key").digest()
+        public = public_key_from_seed(seed).hex().upper()
+        analysis = analyze_public_key(public)
+        self.assertEqual(analysis["score"], 0)
+        record = make_cpu_record(seed, public, analysis, 0.0, 0)
+        record.update(score=50_000_000, score_version=SCORE_VERSION - 1)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config.create(data_directory=Path(directory))
+            categories = empty_category_boards(config.boards)
+            checkpoint({record["repeater_id"]: record}, {public: record}, categories,
+                       1234, 56.0, 7, "private_state", False, config)
+            result = restore_state(config)
+            self.assertEqual(result[:2], ({}, {}))
+            self.assertEqual(result[3:6], (1234, 56.0, 7))
+            archives = list(Path(directory).glob("before_score_*.private.json"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(os.stat(archives[0]).st_mode & 0o777, 0o600)
+            preserved = json.loads(archives[0].read_text())["repeater_ids"][0]
+            self.assertEqual(preserved["private_key"], record["private_key"])
+            restore_state(config)
+            self.assertEqual(len(list(Path(directory).glob("before_score_*.private.json"))), 1)
+            checkpoint({}, {}, categories, 1234, 56.0, 7, "private_state", False, config)
+            self.assertEqual(restore_state(config)[3:6], (1234, 56.0, 7))
 
     def test_accept_refuses_records_with_no_measurable_rarity(self):
         """Backend results bypass the worker cutoff, so accept() must guard.

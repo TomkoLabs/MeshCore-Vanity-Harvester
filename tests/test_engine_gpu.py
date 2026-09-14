@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 
 from meshcore_vanity.catalog import HEX_DIGITS
 from meshcore_vanity.config import GpuConfig
@@ -24,6 +25,21 @@ TARGETS = build_targets(CONFIG)
 
 
 class TargetCatalogTests(unittest.TestCase):
+    def test_every_in_range_ascending_and_descending_sequence_is_hunted(self):
+        prefixes = {prefix for prefix, _, _ in TARGETS}
+        for sequence in ("0123456789ABCDEF", "FEDCBA9876543210"):
+            for start in range(16):
+                for length in range(CONFIG.min_target_length, CONFIG.max_target_length + 1):
+                    if start + length <= 16:
+                        self.assertIn(sequence[start:start + length], prefixes)
+
+    def test_all_valid_run_digits_and_compound_tails_are_hunted(self):
+        prefixes = {prefix for prefix, _, _ in TARGETS}
+        for digit in "123456789ABCDE":
+            for length in range(CONFIG.min_target_length, CONFIG.max_target_length + 1):
+                self.assertIn(digit * length, prefixes)
+        self.assertIn("C0FFEEDEADBEEFFF", prefixes)
+
     def test_targets_are_valid_and_unreserved(self):
         self.assertGreater(len(TARGETS), 0)
         for prefix, priority, description in TARGETS:
@@ -49,6 +65,31 @@ class TargetCatalogTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_longest_affordable_campaign_gets_first_choice(self):
+        config = replace(CONFIG, max_expected_campaign_seconds=100.0)
+        progress = default_progress(config)
+        progress["keys_per_second"] = 16**10 / 50.0
+        targets = (("1" * 9, 999_000, "short"),
+                   ("2" * 10, 1, "long"), ("3" * 11, 1, "too expensive"))
+        self.assertEqual(select_campaign(targets, progress, config), ("2" * 10,))
+
+    def test_regrouping_after_a_find_does_not_erase_target_history(self):
+        config = replace(CONFIG, max_prefixes_per_campaign=2)
+        targets = tuple((str(i) * 9, 100 - i, "run") for i in range(1, 6))
+        progress = default_progress(config)
+        first = select_campaign(targets, progress, config)
+        progress["target_runs"] = dict.fromkeys(first, 1)
+        progress["found_prefixes"] = {first[0]}
+        second = select_campaign(targets, progress, config)
+        self.assertFalse(set(first) & set(second))
+
+    def test_a_shorter_untried_campaign_is_not_starved(self):
+        progress = default_progress(CONFIG)
+        progress["keys_per_second"] = 1e12
+        targets = (("1" * 9, 100, "short"), ("2" * 12, 100, "long"))
+        progress["target_runs"] = {"2" * 12: 1}
+        self.assertEqual(select_campaign(targets, progress, CONFIG), ("1" * 9,))
+
     def test_a_campaign_is_offered_when_targets_remain(self):
         campaign = select_campaign(TARGETS, default_progress(CONFIG), CONFIG)
         self.assertTrue(campaign)

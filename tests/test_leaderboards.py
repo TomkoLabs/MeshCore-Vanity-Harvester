@@ -36,14 +36,17 @@ from meshcore_vanity.storage import (
 
 
 def real_record(tag: str):
-    """A genuine key pair, so validation actually has something to verify."""
-    seed = hashlib.sha256(tag.encode("ascii")).digest()
-    public_key = public_key_from_seed(seed)
-    public_key_hex = public_key.hex().upper()
-    if public_key_hex.startswith(("00", "FF")):
-        return None
-    analysis = analyze_public_key(public_key_hex)
-    return make_cpu_record(seed, public_key_hex, analysis, 0.0, 0)
+    """Find a genuine pair with a prefix pattern for persistence/board tests."""
+    for suffix in range(100_000):
+        seed = hashlib.sha256(f"{tag}-{suffix}".encode("ascii")).digest()
+        public_key_hex = public_key_from_seed(seed).hex().upper()
+        if public_key_hex.startswith(("00", "FF")):
+            continue
+        analysis = analyze_public_key(public_key_hex)
+        if analysis["score"] > 0:
+            return make_cpu_record(seed, public_key_hex, analysis, 0.0, 0)
+    raise AssertionError("could not create a prefix-pattern test identity")
+
 
 
 def synthetic_record(public_key_hex: str, score: int, signature: str, length: int = 8):
@@ -68,6 +71,16 @@ def synthetic_record(public_key_hex: str, score: int, signature: str, length: in
 
 
 class BoardTests(unittest.TestCase):
+    def test_sequence_has_its_own_board(self):
+        config = BoardConfig()
+        categories = empty_category_boards(config)
+        key = ("123456789ABC0" + hashlib.sha256(b"sequence-board").hexdigest().upper())[:64]
+        analysis = analyze_public_key(key)
+        record = synthetic_record(key, analysis["score"], analysis["pattern_signature"])
+        record.update(analysis)
+        self.assertEqual(insert_category(categories, record, config), "sequence")
+        self.assertIn(key, categories["sequence"])
+
     def test_higher_score_replaces_a_weaker_repeater_id_entry(self):
         board = {}
         low = synthetic_record("AAAAAA" + "1" * 58, 10_000_000, "run:A")

@@ -8,8 +8,12 @@
 compile_error!("feature `gpu` requires a backend; enable `cuda`");
 
 pub mod keygen;
+pub mod harvest;
 pub mod search;
 pub mod types;
 
 #[cfg(feature = "cuda")]
 pub mod gpu;
+
+#[cfg(feature = "cuda")]
+pub mod gpu_harvest;

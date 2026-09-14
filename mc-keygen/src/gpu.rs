@@ -1,8 +1,8 @@
 //! CUDA device setup and kernel driving.
 //!
 //! Absorbed from https://github.com/samschlegel/mc-keygen (upstream commit
-//! 62ed67f), unchanged. The kernel in `cuda/vanity_kernel.cu` is compiled by
-//! NVRTC when a search starts, so building this crate needs no CUDA toolkit.
+//! 62ed67f), with device-specific compilation and broad-harvest kernel loading.
+//! NVRTC compiles the kernels at runtime, so building needs no CUDA toolkit.
 
 use std::fmt;
 use std::sync::Arc;
@@ -16,7 +16,11 @@ use rand::RngCore;
 use crate::search::{advance_scalar, clamp_scalar, PrefixMatcher};
 use crate::types::MeshCoreKeypair;
 
-const KERNEL_SRC: &str = include_str!("../cuda/vanity_kernel.cu");
+const KERNEL_SRC: &str = concat!(
+    include_str!("../cuda/harvest_filter.h"), "\n",
+    include_str!("../cuda/vanity_kernel.cu"), "\n",
+    include_str!("../cuda/harvest_kernel.cu"),
+);
 const BLOCK_SIZE: u32 = 256;
 const ITERS_PER_THREAD: u64 = 256;
 
@@ -65,7 +69,7 @@ impl fmt::Display for CudaError {
 impl std::error::Error for CudaError {}
 
 /// Compile the kernel and return (module, context, stream).
-fn compile_kernel() -> Result<(Arc<CudaModule>, Arc<CudaStream>), CudaError> {
+pub(crate) fn compile_kernel() -> Result<(Arc<CudaModule>, Arc<CudaStream>), CudaError> {
     let ctx = CudaContext::new(0).map_err(|e| {
         let msg = format!("{}", e);
         if msg.contains("no device") || msg.contains("not found") {
@@ -75,11 +79,16 @@ fn compile_kernel() -> Result<(Arc<CudaModule>, Arc<CudaStream>), CudaError> {
         }
     })?;
 
+    let major = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+        .map_err(|e| CudaError::CudaDriver(e.to_string()))?;
+    let minor = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        .map_err(|e| CudaError::CudaDriver(e.to_string()))?;
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(
         KERNEL_SRC,
         cudarc::nvrtc::CompileOptions {
             options: vec![
                 "--device-as-default-execution-space".into(),
+                format!("--gpu-architecture=compute_{}{}", major, minor),
             ],
             ..Default::default()
         },
@@ -293,12 +302,9 @@ impl CudaSearcher {
                 let s = Scalar::from_bytes_mod_order(scalar);
                 let cpu_pub = (&s * ED25519_BASEPOINT_TABLE).compress().to_bytes();
                 if cpu_pub != public_key {
-                    return Err(CudaError::CudaDriver(format!(
-                        "GPU match validation failed: scalar·B != pubkey\n  scalar:  {}\n  GPU pub: {}\n  CPU pub: {}",
-                        hex::encode_upper(scalar),
-                        hex::encode_upper(public_key),
-                        hex::encode_upper(cpu_pub),
-                    )));
+                    return Err(CudaError::CudaDriver(
+                        "GPU match validation failed: scalar·B != pubkey".into(),
+                    ));
                 }
             }
 

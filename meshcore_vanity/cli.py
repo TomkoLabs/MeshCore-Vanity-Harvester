@@ -59,6 +59,7 @@ from .report import (
 from .scoring import analyze_public_key, quick_candidate, required_rarity_bits
 from .storage import (
     acquire_single_instance_lock,
+    archive_merge_destination,
     advance_compute_ledger,
     append_history_event,
     checkpoint,
@@ -157,14 +158,18 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         nargs="+",
         metavar="SOURCE",
-        help=("verify and merge private snapshots into --data-dir; the destination's "
+        help=("verify and merge current or legacy private files into --data-dir; the destination's "
               "existing snapshot is included automatically"),
     )
     parser.add_argument("--board", default="hall",
-                        choices=("hall", "ids", "word", "single_run", "periodic", "all"),
+                        choices=("hall", "ids", "word", "single_run", "periodic", "sequence", "all"),
                         help="which board --top shows (default: hall)")
     parser.add_argument("--no-gpu", action="store_true",
                         help="do not use the mc-keygen backend even if it is available")
+    parser.add_argument("--prefix-campaigns", action="store_true",
+                        help="use the legacy exact-prefix scheduler instead of generic prefix harvesting")
+    parser.add_argument("--harvest-min-bits", type=float, default=28.0, metavar="BITS",
+                        help="minimum native harvesting rarity score (default 28; CPU discovery keeps its own cutoff)")
     parser.add_argument("--cpu-workers", type=int, metavar="N",
                         help="number of generic CPU workers")
     parser.add_argument("--max-runtime", type=float, metavar="SECONDS",
@@ -191,13 +196,15 @@ def config_from_arguments(arguments: argparse.Namespace) -> Config:
         raise ValueError("--max-runtime must be positive")
     if arguments.top is not None and arguments.top < 1:
         raise ValueError("--top must be positive")
-    return Config.create(
+    config = Config.create(
         data_directory=arguments.data_dir or default_data_directory(),
         cpu_workers=arguments.cpu_workers,
         gpu_enabled=not arguments.no_gpu,
         max_runtime_seconds=arguments.max_runtime or 0.0,
         node_id=arguments.node_id,
     )
+    return replace(config, gpu=replace(config.gpu, broad_harvest=not arguments.prefix_campaigns,
+                                      harvest_minimum_bits=arguments.harvest_min_bits))
 
 
 # --- Read-only leaderboard viewer -----------------------------------------
@@ -225,6 +232,7 @@ def show_leaderboards(config: Config, style: Style, limit: int, board: str) -> i
         "word": "Best word patterns",
         "single_run": "Best single-character runs",
         "periodic": "Best repeating patterns",
+        "sequence": "Best ascending and descending sequences",
     }
     for name in wanted:
         records = sorted_records(
@@ -244,7 +252,7 @@ def show_leaderboards(config: Config, style: Style, limit: int, board: str) -> i
 
 
 def _snapshot_path(source: Path) -> Path:
-    """Accept either a data directory or leaderboards_private.json itself."""
+    """Accept a data directory, a snapshot, or an explicit legacy key file."""
     expanded = source.expanduser()
     if expanded.is_dir():
         expanded = expanded / PRIVATE_STATE_FILENAME
@@ -260,7 +268,8 @@ def merge_leaderboards(config: Config, style: Style,
 
     # In-place aggregation is the convenient default: on Kraken, one command
     # with GX10's transferred snapshot keeps Kraken's current work as an input.
-    candidates = ([destination] if destination.is_file() else []) + [
+    has_destination = destination.is_file() or config.paths.backup(destination).is_file()
+    candidates = ([destination] if has_destination else []) + [
         _snapshot_path(source) for source in requested_sources
     ]
     for source in candidates:
@@ -287,6 +296,7 @@ def merge_leaderboards(config: Config, style: Style,
             RestoreProgress(style),
             make_pair_verifier(binary),
         )
+        archive_merge_destination(config.paths.private_state)
         checkpoint(
             result.unique,
             result.hall,
@@ -313,7 +323,7 @@ def merge_leaderboards(config: Config, style: Style,
         except OSError:
             pass
 
-    print(style.good(f"Merged {result.source_count} private snapshots successfully."))
+    print(style.good(f"Merged {result.source_count} private files successfully."))
     print("\n".join(labelled([
         ("Destination", str(config.paths.data_directory)),
         ("Distinct keys", f"{result.distinct_keys:,} verified from {result.input_keys:,} input keys"),
@@ -324,6 +334,8 @@ def merge_leaderboards(config: Config, style: Style,
     if result.discarded_keys:
         print(style.warn(
             f"  Ignored {result.discarded_keys:,} malformed or unverifiable input keys."))
+    if result.ineligible_keys:
+        print(style.dim(f"  Excluded {result.ineligible_keys:,} verified identities without a qualifying prefix pattern."))
     if result.rescored_keys:
         print(style.dim(
             f"  Rescored {result.rescored_keys:,} keys from an older scoring model."))
@@ -390,7 +402,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("\n".join(labelled([
             ("Dictionary", catalog_summary()),
             ("Exact prefixes", f"{len(targets):,} targets"),
-            ("Scoring model", f"rev {SCORE_VERSION}, calibrated"),
+            ("Scoring model", f"rev {SCORE_VERSION}, visible ID + prefix rarity"),
             ("Backend", backend.headline),
         ], indent="  ")))
         if backend.remedy:
@@ -621,6 +633,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             last_urgent = now
         return family or ""
 
+    def accept_backend_result(message):
+        record = make_record_from_material(
+            str(message["private_key_hex"]), message.get("seed_hex"),
+            str(message["public_key_hex"]), message["analysis"],
+            float(message["found_timestamp"]), attempts_before + cpu_attempts(),
+            f"mc_keygen_{engine.mode}" if engine else "mc_keygen",
+            message.get("matched_prefix"),
+        )
+        record["gpu_campaign_elapsed_seconds"] = round(
+            float(message.get("gpu_elapsed_seconds", 0.0)), 3)
+        record["gpu_targets_completed_by_result"] = list(
+            message.get("newly_completed_targets", []))
+        if accept(record, time.monotonic()) is not None:
+            announce(record, message.get("gpu_measured_keys_per_second"), always=True)
+
     exit_code = 0
     try:
         while not shutdown_requested:
@@ -649,19 +676,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     break
                 kind = message.get("type")
                 if kind == "keygen_result":
-                    record = make_record_from_material(
-                        str(message["private_key_hex"]), message.get("seed_hex"),
-                        str(message["public_key_hex"]), message["analysis"],
-                        float(message["found_timestamp"]), attempts_before + cpu_attempts(),
-                        f"mc_keygen_{engine.mode}" if engine else "mc_keygen",
-                        str(message["matched_prefix"]),
-                    )
-                    record["gpu_campaign_elapsed_seconds"] = round(
-                        float(message.get("gpu_elapsed_seconds", 0.0)), 3)
-                    record["gpu_targets_completed_by_result"] = list(
-                        message.get("newly_completed_targets", []))
-                    if accept(record, time.monotonic()) is not None:
-                        announce(record, message.get("gpu_measured_keys_per_second"), always=True)
+                    accept_backend_result(message)
                 else:
                     print(style.dim(f"  mc-keygen: {message.get('message', kind)}"),
                           file=sys.stderr, flush=True)
@@ -681,7 +696,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     summary = backend_summary(
                         True, engine.mode, len(snapshot["found_prefixes"]), len(engine.targets),
                         snapshot["matches_total"], snapshot["keys_per_second"],
-                        active_campaign, campaign_elapsed,
+                        active_campaign, campaign_elapsed, harvesting=engine.harvesting,
                     )
                 print(status_line(
                     style, elapsed_before + elapsed_this_run,
@@ -734,6 +749,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=2.0)
+
+        # The native backend flushes already-found keys before acknowledging
+        # stdin shutdown. Retain those final records before the last checkpoint.
+        while True:
+            try:
+                message = engine_queue.get_nowait()
+            except queue.Empty:
+                break
+            if message.get("type") == "keygen_result":
+                accept_backend_result(message)
 
         attempts_run = cpu_attempts()
         elapsed_run = time.monotonic() - start_monotonic

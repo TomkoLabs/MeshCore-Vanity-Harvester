@@ -130,11 +130,15 @@ def engine_block(
 
     lines.append("")
     lines.append(f"  CPU   {cpu_workers} workers of {total_cpus} logical CPUs   "
-                 + style.dim("every pattern shape, anywhere in the key"))
+                 + style.dim("desirable first six characters; longer prefix patterns"))
     if backend.active:
         device = "GPU" if backend.mode == "gpu" else "CPU"
-        lines.append(f"  {device:<5} mc-keygen, {target_count:,} exact prefixes    "
-                     + style.dim("exact prefixes only, far faster"))
+        if backend.harvesting:
+            lines.append(f"  {device:<5} mc-keygen, prefix-pattern harvesting    "
+                         + style.dim("from character zero, up to 64 characters"))
+        else:
+            lines.append(f"  {device:<5} mc-keygen, {target_count:,} exact prefixes    "
+                         + style.dim("exact prefixes only, far faster"))
     else:
         lines.append("  " + style.dim("mc-keygen  not running"))
     return lines
@@ -214,10 +218,13 @@ def backend_summary(
     keys_per_second: float,
     active_campaign: Sequence[str],
     campaign_elapsed: float,
+    harvesting: bool = False,
 ) -> str:
     if not active:
         return "GPU off"
     label = "GPU" if mode == "gpu" else "mc-keygen"
+    if harvesting:
+        return f"{label} {rate(keys_per_second)} ({matches} found, prefix patterns, up to 64 characters)"
     if active_campaign:
         activity = f"hunting {len(active_campaign)}x{len(active_campaign[0])}-char for {duration(campaign_elapsed)}"
     else:

@@ -38,7 +38,7 @@ LOCK_FILENAME = ".harvester.lock"
 PACKAGE_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_DIRECTORY = PACKAGE_DIRECTORY.parent
 
-CATEGORY_BOARD_FAMILIES: Tuple[str, ...] = ("word", "single_run", "periodic")
+CATEGORY_BOARD_FAMILIES: Tuple[str, ...] = ("word", "single_run", "periodic", "sequence")
 NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -171,16 +171,18 @@ class CpuConfig:
 
 @dataclass(frozen=True)
 class GpuConfig:
-    """mc-keygen exact-prefix campaign settings."""
+    """Native prefix harvesting and optional legacy campaign settings."""
 
     enabled: bool = True
+    broad_harvest: bool = True
+    harvest_minimum_bits: float = 28.0
     run_startup_self_test: bool = True
     self_test_timeout_seconds: float = 120.0
     device_index: str = "0"
     cuda_module_loading: str = "EAGER"
     max_prefixes_per_campaign: int = 64
     min_target_length: int = 9
-    max_target_length: int = 14
+    max_target_length: int = 16
     campaign_time_slice_seconds: float = 15 * 60.0
     max_expected_campaign_seconds: float = 6 * 60 * 60.0
     default_keys_per_second: float = 10_000_000.0
@@ -289,6 +291,8 @@ class Config:
             raise ValueError("all aesthetic bonuses combined must stay below one rarity bit")
         if not 6 <= self.gpu.min_target_length <= self.gpu.max_target_length <= 62:
             raise ValueError("invalid GPU target length range")
+        if not 16 <= self.gpu.harvest_minimum_bits <= 256:
+            raise ValueError("harvest minimum must be between 16 and 256 rarity bits")
         if self.boards.max_per_signature < 0:
             raise ValueError("max_per_signature must not be negative")
 

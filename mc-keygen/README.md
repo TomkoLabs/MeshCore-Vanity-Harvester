@@ -1,7 +1,7 @@
 # mc-keygen
 
 Vanity Ed25519 key generator for [MeshCore](https://github.com/ripplebiz/MeshCore).
-Finds keys whose public key starts with a chosen hex prefix.
+Harvests patterns beginning at character zero, or searches chosen exact prefixes.
 
 Originally [samschlegel/mc-keygen](https://github.com/samschlegel/mc-keygen);
 now maintained as part of this project. See [ATTRIBUTION.md](ATTRIBUTION.md)
@@ -15,6 +15,7 @@ goes to stdout and progress goes to stderr.
 ```
 mc-keygen <PREFIX>... [OPTIONS]
 mc-keygen verify-pairs
+mc-keygen harvest --policy POLICY.json --seconds 900 [--gpu-only]
 ```
 
 **Options**
@@ -31,6 +32,13 @@ re-derive saved keys on startup: keys found on the GPU have no seed, so they
 must be checked by scalar multiplication, which costs about 95 ms each in
 Python and microseconds here.
 
+**`harvest`** streams multiple independently generated matches and exact attempt
+statistics as JSON Lines. Python generates its policy; normally use `./run.sh`
+from the project root. `--stdin-stop` enables graceful supervisor shutdown and
+`--benchmark` emits only statistics, never private keys. CUDA harvesting runs a
+mandatory host/device verification before accepting work. See
+[GPU details](docs/gpu.md) and [search strategy](../docs/search-strategy.md).
+
 **Examples**
 
 ```bash
@@ -41,9 +49,10 @@ mc-keygen C0FFEEC0F --gpu-only      # GPU only, for longer prefixes
 echo '{"public_key":"AB…","private_key":"CD…"}' | mc-keygen verify-pairs
 ```
 
-Multiple prefixes cost almost nothing extra: every generated key is checked
-against all of them, so searching for N prefixes is roughly N times more
-efficient than N separate runs. The JSON output names the one that matched.
+Multiple distinct equal-length prefixes increase the hit probability in
+proportion to their count, but matching overhead also grows. The legacy JSON
+output names the one that matched. Prefix harvesting uses a shared word trie
+and pattern predicates rather than this exact-prefix list.
 
 ## Search difficulty
 
@@ -67,7 +76,9 @@ cargo build --release --features cuda    # with NVIDIA GPU support
 ```
 
 The CUDA kernel is compiled at runtime by NVRTC, so building needs no CUDA
-toolkit — only running with `--features cuda` needs a driver. `install.sh` in
+toolkit; GPU execution needs the driver and NVRTC libraries. Rust 1.88+
+is required for the locked CUDA dependencies. A C compiler builds the shared
+CPU/GPU filter. `install.sh` in
 the project root handles this for you.
 
 ## How it works

@@ -29,7 +29,7 @@ Before submitting:
 python -m unittest discover -s tests -v
 python -m meshcore_vanity --self-test
 python scripts/check_calibration.py
-shellcheck install.sh run.sh scripts/vendor-mc-keygen.sh
+shellcheck install.sh run.sh
 cargo test --manifest-path mc-keygen/Cargo.toml --locked
 ```
 

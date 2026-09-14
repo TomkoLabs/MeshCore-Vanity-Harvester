@@ -1,10 +1,9 @@
-"""mc-keygen exact-prefix campaign driver.
+"""Native prefix-pattern harvesting and legacy exact-prefix campaigns.
 
-The Python workers search openly but slowly; mc-keygen searches only for fixed
-prefixes but is orders of magnitude faster, especially on a GPU. This module
-turns the pattern catalog into a prioritised list of exact prefixes, schedules
-them in bounded time slices, and independently re-verifies every key that comes
-back before it is allowed anywhere near the leaderboards.
+Current binaries stream prefix-pattern results and exact progress statistics.
+Python supplies conservative screening thresholds and independently verifies
+and ranks every accepted key. Older binaries, or --prefix-campaigns, use the
+bounded exact-prefix scheduler below.
 
 Two behaviours worth knowing about:
 
@@ -22,8 +21,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
+import selectors
 import shutil
 import subprocess
 import tempfile
@@ -36,6 +37,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from . import STATE_FORMAT_VERSION, project_revision
 from .catalog import HEX_DIGITS, HEX_WORDS, LOCAL_EXACT_PREFIXES
 from .config import Config, GpuConfig, PROJECT_DIRECTORY
+from .harvest import build_policy
 from .keys import (
     is_reserved_public_key,
     loose_hex,
@@ -102,6 +104,10 @@ def build_targets(config: GpuConfig) -> Tuple[GpuTarget, ...]:
             add(compound,
                 620_000 + HEX_WORDS[left][0] + HEX_WORDS[right][0] + len(compound) * 24_000,
                 f"compound words '{left}' + '{right}'")
+            for length in range(max(low, len(compound) + 1), high + 1):
+                add(compound + compound[-1] * (length - len(compound)),
+                    560_000 + HEX_WORDS[left][0] + HEX_WORDS[right][0] + length * 24_000,
+                    f"compound words '{left}' + '{right}' with extended final run")
 
     for character in "123456789ABCDE":
         for length in range(low, high + 1):
@@ -109,9 +115,11 @@ def build_targets(config: GpuConfig) -> Tuple[GpuTarget, ...]:
                 750_000 + length * 35_000 + (80_000 if character == "4" else 0),
                 f"{length} identical leading '{character}' characters")
 
-    for sequence, label in (("123456789ABCDEF", "ascending"), ("FEDCBA9876543210", "descending")):
-        for length in range(low, min(high, len(sequence)) + 1):
-            add(sequence[:length], 640_000 + length * 26_000, f"specific {label} sequence")
+    for sequence, label in (("0123456789ABCDEF", "ascending"), ("FEDCBA9876543210", "descending")):
+        for start in range(len(sequence) - low + 1):
+            for length in range(low, min(high, len(sequence) - start) + 1):
+                add(sequence[start:start + length], 640_000 + length * 26_000,
+                    f"{label} sequence starting at '{sequence[start]}'")
 
     for unit in ("14", "44", "51", "514", "AB", "BA", "ACE", "CA", "FE", "DE",
                  "AD", "BE", "EE", "C0", "C0FFEE", "CAFE", "BEBE", "FACE", "DEAD"):
@@ -131,8 +139,8 @@ _EXPECTED_SCORE_CACHE: Dict[str, int] = {}
 def expected_target_score(prefix: str) -> int:
     """What a key starting with this prefix would score, filler aside.
 
-    Lets the scheduler skip targets whose best possible result could not reach
-    the current leaderboard cutoff, rather than spending GPU hours on them.
+    A heuristic for target selection, not an upper bound: a random suffix can
+    always extend the prefix or contain another, better pattern.
     """
     cached = _EXPECTED_SCORE_CACHE.get(prefix)
     if cached is not None:
@@ -236,13 +244,14 @@ def detect_capabilities(binary: Path) -> Dict[str, bool]:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {"gpu": False, "verify": False, "threads": False, "verify_pairs": False}
+        return {"gpu": False, "verify": False, "threads": False, "verify_pairs": False, "harvest": False}
     text = completed.stdout or ""
     return {
         "gpu": "--gpu-only" in text,
         "verify": "--verify" in text,
         "threads": "--threads" in text,
         "verify_pairs": "verify-pairs" in text,
+        "harvest": "harvest" in text and "policy-v2" in text,
     }
 
 
@@ -255,6 +264,7 @@ class BackendStatus:
     headline: str        # one line the user can act on
     detail: str          # supporting line
     remedy: Optional[str] = None   # what to do about it, when not active
+    harvesting: bool = False
 
 
 def describe_backend(
@@ -278,7 +288,7 @@ def describe_backend(
         return BackendStatus(
             False, "off",
             "CPU only - the mc-keygen backend was disabled with --no-gpu",
-            "Generic pattern search across all 64 characters.",
+            "Pattern search from character zero; visible six-character IDs come first.",
             "Drop --no-gpu to use it." + (f" An {describe_device(device)} is present." if device else ""),
         )
 
@@ -287,24 +297,26 @@ def describe_backend(
             return BackendStatus(
                 False, "off",
                 f"CPU only - an {describe_device(device)} is present but mc-keygen is not built",
-                "The GPU is idle. Building the backend would search several thousand times faster.",
+                "The GPU is idle. Build the native backend to enable accelerated searching.",
                 "Run ./install.sh again; it will install what the CUDA build needs.",
             )
         return BackendStatus(
             False, "off",
             "CPU only - no NVIDIA GPU detected and no mc-keygen binary found",
-            "Generic pattern search across all 64 characters.",
+            "Pattern search from character zero; visible six-character IDs come first.",
             None,
         )
 
     gpu_capable = bool(capabilities and capabilities.get("gpu"))
+    harvesting = config.broad_harvest and bool(capabilities and capabilities.get("harvest"))
 
     if gpu_capable and device:
         return BackendStatus(
             True, "gpu",
             f"CPU + GPU - both engines running on an {describe_device(device)}",
-            "CPU searches every pattern shape; the GPU hunts exact prefixes far faster.",
-            None,
+            ("CPU and GPU hunt desirable IDs and longer patterns from character zero." if harvesting else
+             "CPU searches every pattern shape; the GPU hunts exact prefixes far faster."),
+            None, harvesting=harvesting,
         )
 
     if gpu_capable:
@@ -312,17 +324,21 @@ def describe_backend(
         return BackendStatus(
             True, "cpu",
             "CPU + mc-keygen - no GPU detected, so it searches on the processor",
-            "mc-keygen is helping with exact prefixes, but without the speed a GPU would add.",
+            ("mc-keygen hunts desirable IDs and longer prefixes on the CPU." if harvesting else
+             "mc-keygen is helping with exact prefixes, but without the speed a GPU would add."),
             "If this machine does have an NVIDIA card, check the driver: nvidia-smi should list it.",
+            harvesting=harvesting,
         )
 
     return BackendStatus(
         True, "cpu",
         "CPU + mc-keygen (CPU build) - the GPU kernel is not compiled in",
-        "mc-keygen is helping with exact prefixes, but on the processor rather than the GPU.",
+        ("mc-keygen hunts desirable IDs and longer prefixes on the CPU." if harvesting else
+         "mc-keygen is helping with exact prefixes, but on the processor rather than the GPU."),
         (f"An {describe_device(device)} is present. Rebuild with --features cuda to use it: "
          "cargo build --release --features cuda --manifest-path mc-keygen/Cargo.toml")
         if device else None,
+        harvesting=harvesting,
     )
 
 
@@ -435,6 +451,9 @@ def default_progress(config: GpuConfig) -> Dict[str, Any]:
         "last_match_at": None,
         "keys_per_second": config.default_keys_per_second,
         "campaign_runs": {},
+        "target_runs": {},
+        "harvest_attempts_total": 0,
+        "harvest_replayed_attempts_total": 0,
         "escalations": 0,
     }
 
@@ -447,6 +466,9 @@ def load_progress(config: Config, known_prefixes: Set[str]) -> Dict[str, Any]:
     campaign_runs = payload.get("campaign_runs")
     if not isinstance(campaign_runs, dict):
         campaign_runs = {}
+    target_runs = payload.get("target_runs", {})
+    if not isinstance(target_runs, dict):
+        target_runs = {}
     progress.update({
         "found_prefixes": {p for p in payload.get("found_prefixes", []) if p in known_prefixes},
         "matches_total": int(payload.get("matches_total", 0)),
@@ -457,6 +479,9 @@ def load_progress(config: Config, known_prefixes: Set[str]) -> Dict[str, Any]:
         "last_match_at": payload.get("last_match_at"),
         "keys_per_second": max(1.0, float(payload.get("keys_per_second", config.gpu.default_keys_per_second))),
         "campaign_runs": {str(k): int(v) for k, v in campaign_runs.items()},
+        "target_runs": {p: max(0, int(v)) for p, v in target_runs.items() if p in known_prefixes},
+        "harvest_attempts_total": max(0, int(payload.get("harvest_attempts_total", 0))),
+        "harvest_replayed_attempts_total": max(0, int(payload.get("harvest_replayed_attempts_total", 0))),
         "escalations": int(payload.get("escalations", 0)),
     })
     return progress
@@ -477,6 +502,9 @@ def save_progress(progress: Mapping[str, Any], config: Config, target_count: int
         "last_match_at": progress.get("last_match_at"),
         "keys_per_second": round(float(progress.get("keys_per_second", 0.0)), 3),
         "campaign_runs": dict(progress.get("campaign_runs", {})),
+        "target_runs": dict(progress.get("target_runs", {})),
+        "harvest_attempts_total": int(progress.get("harvest_attempts_total", 0)),
+        "harvest_replayed_attempts_total": int(progress.get("harvest_replayed_attempts_total", 0)),
         "escalations": int(progress.get("escalations", 0)),
     })
     atomic_write_json(config.paths.gpu_progress, payload, private=False)
@@ -497,10 +525,10 @@ def select_campaign(
 ) -> Tuple[str, ...]:
     """Pick the next batch of prefixes to hunt.
 
-    Preference order: campaigns never attempted, then cheapest, then highest
-    priority. Targets that could not beat the current leaderboard cutoff even
-    on success are skipped, and the difficulty budget escalates rather than
-    running out.
+    Rotate by attempts per prefix, then favour the longest affordable targets.
+    A successful find changes batch membership; keeping history per prefix
+    prevents the remaining targets from masquerading as untried work.
+    Expected scores guide selection but cannot bound a random suffix's score.
     """
     found = set(progress.get("found_prefixes", set()))
     unresolved = [target for target in targets if target[0] not in found]
@@ -513,24 +541,29 @@ def select_campaign(
 
     rate = max(1.0, float(progress.get("keys_per_second", config.default_keys_per_second)))
     runs = progress.get("campaign_runs", {})
+    target_runs = progress.get("target_runs", {})
     escalations = min(int(progress.get("escalations", 0)), config.max_escalations)
     budget = config.max_expected_campaign_seconds * (config.escalation_factor ** escalations)
 
-    candidates: List[Tuple[int, float, int, int, Tuple[str, ...]]] = []
+    candidates: List[Tuple[float, int, float, int, Tuple[str, ...]]] = []
     for length in sorted({len(target[0]) for target in unresolved}):
         same_length = [target for target in unresolved if len(target[0]) == length]
-        same_length.sort(key=lambda target: (-target[1], target[0]))
+        same_length.sort(key=lambda target: (int(target_runs.get(target[0], 0)), -target[1], target[0]))
         for offset in range(0, len(same_length), config.max_prefixes_per_campaign):
             chunk = same_length[offset:offset + config.max_prefixes_per_campaign]
             campaign = tuple(target[0] for target in chunk)
             expected_seconds = (16.0 ** length / max(1, len(campaign))) / rate
             if expected_seconds > budget:
                 continue
+            # Old progress files only have exact-batch history. Use it until
+            # per-prefix history is available; retain it for status/auditing.
+            attempts = (sum(int(target_runs.get(prefix, 0)) for prefix in campaign) / len(campaign)
+                        if target_runs else int(runs.get(campaign_id(campaign), 0)))
             candidates.append((
-                int(runs.get(campaign_id(campaign), 0)),
+                attempts,
+                -length,
                 expected_seconds,
                 -sum(target[1] for target in chunk),
-                length,
                 campaign,
             ))
 
@@ -706,7 +739,11 @@ class KeygenEngine:
         if process is None or process.poll() is not None:
             return
         try:
-            process.kill() if kill else process.terminate()
+            if not kill and process.stdin is not None:
+                process.stdin.write(b"stop\n")
+                process.stdin.flush()
+            else:
+                process.kill() if kill else process.terminate()
         except OSError:
             pass
 
@@ -718,6 +755,7 @@ class KeygenEngine:
             snapshot = dict(self.progress)
             snapshot["found_prefixes"] = set(self.progress["found_prefixes"])
             snapshot["campaign_runs"] = dict(self.progress["campaign_runs"])
+            snapshot["target_runs"] = dict(self.progress["target_runs"])
             snapshot["active_campaign"] = self.active_campaign
             snapshot["active_started"] = self.active_started
             snapshot["alive"] = self.thread.is_alive()
@@ -737,6 +775,10 @@ class KeygenEngine:
     def mode(self) -> str:
         """What this backend is really doing, not what it was built to do."""
         return "gpu" if self.capabilities.get("gpu") and self.device else "cpu"
+
+    @property
+    def harvesting(self) -> bool:
+        return self.gpu.broad_harvest and bool(self.capabilities.get("harvest"))
 
     @property
     def status(self) -> BackendStatus:
@@ -762,6 +804,10 @@ class KeygenEngine:
     # -- verification -------------------------------------------------------
 
     def _verify_backend(self) -> bool:
+        if self.harvesting:
+            # The new native path performs its own mandatory in-process CUDA
+            # self-test, including the filter, multiple threads and overflow.
+            return True
         # --verify cross-checks the GPU kernel against the host. With no GPU
         # there is nothing to cross-check.
         if (not self.gpu.run_startup_self_test
@@ -794,6 +840,19 @@ class KeygenEngine:
 
         consecutive_failures = 0
         while not self.stop_event.is_set():
+            if self.harvesting:
+                outcome = self._run_harvest()
+                if self.stop_event.is_set():
+                    break
+                if outcome == "failure":
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.gpu.max_consecutive_failures:
+                        self._emit("disabled", "harvesting disabled after repeated failures")
+                        break
+                    self.stop_event.wait(self.gpu.retry_delay_seconds)
+                else:
+                    consecutive_failures = 0
+                continue
             campaign = self._next_campaign()
             if not campaign:
                 if not self._escalate():
@@ -829,6 +888,135 @@ class KeygenEngine:
             self.active_started = time.monotonic() if campaign else None
         return campaign
 
+    def _harvest_event(self, payload: Any, previous: Tuple[int, float, int], policy_cutoff: int) -> Tuple[int, float, int]:
+        if not isinstance(payload, dict):
+            raise ValueError("harvest event must be an object")
+        kind = payload.get("type")
+        if kind in ("stats", "done"):
+            attempts = payload.get("attempts")
+            elapsed = payload.get("elapsed_secs")
+            replayed = payload.get("replayed_attempts")
+            if (type(attempts) is not int or not previous[0] <= attempts < 2**64
+                    or type(replayed) is not int or not previous[2] <= replayed < 2**64
+                    or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed)
+                    or elapsed <= 0 or elapsed < previous[1]):
+                raise ValueError("invalid or decreasing harvest statistics")
+            with self.lock:
+                self.progress["harvest_attempts_total"] += attempts - previous[0]
+                self.progress["harvest_replayed_attempts_total"] += replayed - previous[2]
+                window = elapsed - previous[1]
+                if window > 0:
+                    rate = (attempts - previous[0]) / window
+                    alpha = self.gpu.rate_ewma_alpha
+                    self.progress["keys_per_second"] = (rate if previous[1] == 0 else
+                        self.progress["keys_per_second"] * (1 - alpha) + rate * alpha)
+            return attempts, float(elapsed), replayed
+        if kind != "match":
+            raise ValueError("unknown harvest event type")
+        public = loose_hex(payload.get("public_key"))
+        if public is None or len(public) != 64 or is_reserved_public_key(public):
+            raise ValueError("invalid harvested public key")
+        analysis = dict(analyze_public_key(public))
+        with self.lock:
+            cutoff = max(policy_cutoff, self.cutoff_score)
+        if analysis["score"] < cutoff:
+            return previous  # Native screening is conservative; Python ranks.
+        private, seed = normalize_external_private_key(payload, public)
+        analysis["reasons"] = [f"{self.mode.upper()} prefix-pattern harvesting", *analysis["reasons"]][:8]
+        self._record_match({
+            "private_key_hex": private, "seed_hex": seed, "public_key_hex": public,
+            "analysis": analysis, "matched_prefix": None,
+        }, 0.0)
+        return previous
+
+    def _run_harvest(self) -> str:
+        """Drain bounded JSON lines continuously; stop via stdin and save all hits."""
+        with self.lock:
+            policy_cutoff = max(self.cutoff_score, int(self.gpu.harvest_minimum_bits * 1_000_000))
+            self.active_campaign = ()
+            self.active_started = time.monotonic()
+        started = time.monotonic()
+        previous = (0, 0.0, 0)
+        done = False
+        stop_sent = None
+        process = None
+        failure = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="meshcore-policy-") as directory, tempfile.TemporaryFile() as errors:
+                policy_file = Path(directory) / "policy.json"
+                policy_file.write_text(json.dumps(build_policy(policy_cutoff)), encoding="ascii")
+                command = build_command(self.binary, [
+                    "harvest", "--policy", str(policy_file), "--seconds",
+                    str(min(86400.0, self.gpu.campaign_time_slice_seconds)), "--stdin-stop",
+                    *self._mode_arguments(),
+                ], self.gpu_host_cpu_ids)
+                process = subprocess.Popen(command, cwd=str(PROJECT_DIRECTORY),
+                    env=subprocess_environment(self.gpu), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=errors)
+                with self.lock:
+                    self.current_process = process
+                os.set_blocking(process.stdout.fileno(), False)
+                pending = b""
+                deadline = started + self.gpu.campaign_time_slice_seconds + self.gpu.self_test_timeout_seconds + 30
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while True:
+                        now = time.monotonic()
+                        if (self.stop_event.is_set() or now >= deadline) and stop_sent is None:
+                            self._terminate_current(kill=False)
+                            stop_sent = now
+                        if stop_sent is not None and now - stop_sent > 6:
+                            self._terminate_current(kill=True)
+                            raise ValueError("harvester did not stop gracefully")
+                        if not selector.select(timeout=0.1):
+                            continue
+                        chunk = os.read(process.stdout.fileno(), 65536)
+                        if not chunk:
+                            break
+                        pending += chunk
+                        while b"\n" in pending:
+                            line, pending = pending.split(b"\n", 1)
+                            if len(line) > 16384:
+                                raise ValueError("oversized harvest event")
+                            if done:
+                                raise ValueError("harvest event after completion")
+                            payload = json.loads(line)
+                            previous = self._harvest_event(payload, previous, policy_cutoff)
+                            done = payload.get("type") == "done"
+                        if len(pending) > 16384:
+                            raise ValueError("oversized harvest event")
+                return_code = process.wait(timeout=3)
+                if pending or not done or return_code != 0:
+                    # Do not echo the stdout stream: it carries private keys.
+                    errors.seek(0, os.SEEK_END)
+                    size = errors.tell()
+                    errors.seek(max(0, size - 1000))
+                    detail = errors.read().decode("utf-8", "replace").strip()
+                    raise ValueError("harvest stream did not finish cleanly" + (f": {detail}" if detail else ""))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = str(error)
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
+                if process.stdin is not None:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+                if process.stdout is not None:
+                    process.stdout.close()
+            with self.lock:
+                self.current_process = None
+                self.active_started = None
+                self.progress["elapsed_seconds_total"] += time.monotonic() - started
+            self.save()
+        if failure is not None:
+            self._record_failure(f"prefix-pattern harvesting failed: {failure}")
+            return "failure"
+        return "stopped" if self.stop_event.is_set() else "complete"
+
     def _escalate(self) -> bool:
         """Raise the difficulty budget instead of idling with the device free."""
         with self.lock:
@@ -862,6 +1050,9 @@ class KeygenEngine:
                 self.current_process = process
                 runs = self.progress["campaign_runs"]
                 runs[identifier] = int(runs.get(identifier, 0)) + 1
+                target_runs = self.progress["target_runs"]
+                for prefix in campaign:
+                    target_runs[prefix] = int(target_runs.get(prefix, 0)) + 1
 
             deadline = started + self.gpu.campaign_time_slice_seconds
             while process.poll() is None and not self.stop_event.wait(0.25):
